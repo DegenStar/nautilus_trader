@@ -258,7 +258,7 @@ v2 候选发布 wheel 使用 `2.0.0rcN` 版本号，供社区在最终 `2.0.0` �
 pip install -U "nautilus_trader[visualization]"
 ```
 
-详情请参阅[安装指南](https://nautilustrader.io/docs/latest/getting_started/installation#extras)。
+详情请参阅[安装指南](QUICKSTART-CN.md)。
 
 ### 从 Nautech Systems 软件包索引安装
 
