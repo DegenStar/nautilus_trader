@@ -32,7 +32,7 @@ Linux 的 glibc 必须为 2.35 或更高版本，可运行 `ldd --version` 查�
 curl -fsSL https://gitlab.com/nautilustrader/scripts/raw/main/install.sh | bash
 ```
 
-**🖥️ Windows PowerShell：**
+**🖥️ Windows PowerShell（以管理员身份运行）：**
 
 ```powershell
 iwr -useb https://gitlab.com/nautilustrader/scripts/raw/main/install.ps1 | iex
