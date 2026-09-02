@@ -210,7 +210,7 @@ NautilusTrader 的核心值类型（`Price`、`Quantity`、`Money`）支持两�
 > 对于纯 Rust crate，由于 Rust 通过软件模拟处理 `i128`/`u128`，高精度模式可在所有平台
 > （包括 Windows）上运行。默认采用标准精度模式，除非显式启用 `high-precision` 功能标志。
 
-更多详情请参阅[安装指南](https://nautilustrader.io/docs/latest/getting_started/installation)。
+更多详情请参阅[安装指南](QUICKSTART-CN.md)。
 
 **Rust 功能标志**：要在 Rust 中启用高精度模式，请在 `Cargo.toml` 中添加 `high-precision` 功能：
 
@@ -469,7 +469,7 @@ curl -s https://packages.nautechsystems.io/simple/nautilus-trader/index.html | s
    make build
    ```
 
-有关其他选项和更多详情，请参阅[安装指南](https://nautilustrader.io/docs/latest/getting_started/installation)。
+有关其他选项和更多详情，请参阅[安装指南](QUICKSTART-CN.md)。
 
 ## Redis
 
