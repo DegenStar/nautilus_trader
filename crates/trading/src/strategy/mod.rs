@@ -14,6 +14,8 @@
 // -------------------------------------------------------------------------------------------------
 
 pub mod api;
+#[doc(hidden)]
+pub mod binding;
 pub mod config;
 pub mod core;
 
@@ -22,6 +24,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use ahash::AHashSet;
 pub use api::{OrderApi, PortfolioApi};
+use binding::StrategyBinding;
 pub use config::{ImportableStrategyConfig, StrategyConfig};
 use nautilus_common::{
     actor::DataActor,
@@ -35,7 +38,7 @@ use nautilus_common::{
     msgbus::{self, MessagingSwitchboard},
     timer::TimeEvent,
 };
-use nautilus_core::{Params, UUID4};
+use nautilus_core::{DurationNanos, Params, UUID4};
 use nautilus_execution::order_manager::OrderManagerAction;
 use nautilus_model::{
     enums::{OrderSide, OrderStatus, PositionSide, TimeInForce},
@@ -102,12 +105,42 @@ pub type BatchModifyOrder = (
 /// [`StrategyNative`] and [`Component`] bounds. Implementations that only need
 /// behavioral callbacks do not own or implement native runtime state.
 pub trait Strategy: DataActor {
-    /// Returns the external order claims for this strategy.
+    /// Returns the instrument IDs this strategy intends to claim for external order routing.
     ///
-    /// These are instrument IDs whose external orders should be claimed by this strategy
-    /// during reconciliation.
-    fn external_order_claims(&self) -> Option<Vec<InstrumentId>> {
+    /// Live strategy registration materializes this configuration intent as active cache claims.
+    fn external_order_instrument_ids(&self) -> Option<Vec<InstrumentId>> {
         None
+    }
+
+    /// Replaces this strategy's active external order claims with `instrument_ids`.
+    ///
+    /// External orders, fills, and materialized reconciliation activity for matching instrument
+    /// IDs are assigned to the strategy. Passing an empty vector releases every claim owned by the
+    /// strategy. Existing cached orders keep their assigned strategy ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the strategy is not registered, the cache is already borrowed, an
+    /// instrument is repeated, or an instrument is claimed by another strategy.
+    fn set_external_order_instrument_ids(
+        &mut self,
+        instrument_ids: Vec<InstrumentId>,
+    ) -> anyhow::Result<()>
+    where
+        Self: StrategyNative,
+    {
+        let core = StrategyNative::strategy_core_mut(self);
+        let strategy_id = registered_strategy_id(core)?;
+        if !core.actor.is_registered() {
+            anyhow::bail!("Strategy {strategy_id} is not registered with a trader");
+        }
+        let cache = core.cache_rc();
+        cache
+            .try_borrow_mut()
+            .map_err(|e| anyhow::anyhow!("Cannot set external order claims: {e}"))?
+            .set_external_order_claims(strategy_id, &instrument_ids)?;
+        core.config.external_order_instrument_ids = Some(instrument_ids);
+        Ok(())
     }
 
     /// Returns the runtime strategy ID, when configured or registered.
@@ -147,74 +180,9 @@ pub trait Strategy: DataActor {
         params: Option<Params>,
     ) -> anyhow::Result<()>
     where
-        Self: StrategyNative,
+        Self: StrategyBinding,
     {
-        let core = StrategyNative::strategy_core_mut(self);
-
-        let trader_id = registered_trader_id(core)?;
-        let strategy_id = registered_strategy_id(core)?;
-        let ts_init = core.clock_mut().timestamp_ns();
-
-        if order.status() != OrderStatus::Initialized {
-            anyhow::bail!(
-                "Order denied: invalid status for {}, expected INITIALIZED",
-                order.client_order_id()
-            );
-        }
-
-        let market_exit_tag = core.market_exit_tag;
-        let is_market_exit_order = order
-            .tags()
-            .is_some_and(|tags| tags.contains(&market_exit_tag));
-        let should_deny_for_market_exit =
-            core.is_exiting && !order.is_reduce_only() && !is_market_exit_order;
-
-        if should_deny_for_market_exit {
-            self.deny_order(&order, Ustr::from("MARKET_EXIT_IN_PROGRESS"));
-            return Ok(());
-        }
-
-        let core = StrategyNative::strategy_core_mut(self);
-        let params = params.filter(|params| !params.is_empty());
-
-        {
-            let cache_rc = core.cache_rc();
-            let mut cache = cache_rc.try_borrow_mut().map_err(|_| {
-                anyhow::anyhow!(
-                    "Cannot submit order {}: cache is currently borrowed",
-                    order.client_order_id()
-                )
-            })?;
-            cache.add_order(order.clone(), position_id, client_id, true)?;
-        }
-
-        publish_order_initialized(&order);
-
-        let command = SubmitOrder::new(
-            trader_id,
-            client_id,
-            strategy_id,
-            order.instrument_id(),
-            order.client_order_id(),
-            order.init_event().clone(),
-            order.exec_algorithm_id(),
-            position_id,
-            params,
-            UUID4::new(),
-            ts_init,
-            None, // correlation_id
-        );
-
-        if order.emulation_trigger().is_some() {
-            send_emulator_command(TradingCommand::SubmitOrder(command));
-        } else if let Some(exec_algorithm_id) = order.exec_algorithm_id() {
-            send_algo_command(command, exec_algorithm_id);
-        } else {
-            send_risk_command(TradingCommand::SubmitOrder(command));
-        }
-
-        self.set_gtd_expiry(&order)?;
-        Ok(())
+        self.binding_submit_order(order, position_id, client_id, params)
     }
 
     /// Submits an order list.
@@ -1807,7 +1775,11 @@ pub trait Strategy: DataActor {
 
         log::info!("{strategy_id} Setting market exit timer at {interval_ms}ms intervals");
 
-        let interval_ns = interval_ms * 1_000_000;
+        let Ok(interval_ns) = DurationNanos::try_from_millis(interval_ms) else {
+            core.is_exiting = false;
+            core.market_exit_attempts = 0;
+            anyhow::bail!("Market exit timer interval exceeds the nanosecond range");
+        };
         let result = core.clock_mut().set_timer_ns(
             timer_name.as_str(),
             interval_ns,
@@ -2237,7 +2209,6 @@ pub trait Strategy: DataActor {
     {
         let timer_name = event.name;
         let Some(client_order_id) = timer_name
-            .as_str()
             .strip_prefix("GTD-EXPIRY:")
             .and_then(|value| ClientOrderId::new_checked(value).ok())
         else {
@@ -2320,7 +2291,6 @@ where
         let core = StrategyNative::strategy_core(strategy);
         let gtd_order_id = event
             .name
-            .as_str()
             .strip_prefix("GTD-EXPIRY:")
             .and_then(|value| ClientOrderId::new_checked(value).ok())
             .filter(|client_order_id| core.gtd_timers.get(client_order_id) == Some(&event.name));
@@ -2343,6 +2313,84 @@ where
     } else {
         strategy.check_market_exit(event.clone());
     }
+}
+
+pub(super) fn submit_order_native<T>(
+    strategy: &mut T,
+    order: &OrderAny,
+    position_id: Option<PositionId>,
+    client_id: Option<ClientId>,
+    params: Option<Params>,
+) -> anyhow::Result<()>
+where
+    T: Strategy + StrategyNative + ?Sized,
+{
+    let core = StrategyNative::strategy_core_mut(strategy);
+
+    let trader_id = registered_trader_id(core)?;
+    let strategy_id = registered_strategy_id(core)?;
+    let ts_init = core.clock_mut().timestamp_ns();
+
+    if order.status() != OrderStatus::Initialized {
+        anyhow::bail!(
+            "Order denied: invalid status for {}, expected INITIALIZED",
+            order.client_order_id()
+        );
+    }
+
+    let market_exit_tag = core.market_exit_tag;
+    let is_market_exit_order = order
+        .tags()
+        .is_some_and(|tags| tags.contains(&market_exit_tag));
+    let should_deny_for_market_exit =
+        core.is_exiting && !order.is_reduce_only() && !is_market_exit_order;
+
+    if should_deny_for_market_exit {
+        strategy.deny_order(order, Ustr::from("MARKET_EXIT_IN_PROGRESS"));
+        return Ok(());
+    }
+
+    let core = StrategyNative::strategy_core_mut(strategy);
+    let params = params.filter(|params| !params.is_empty());
+
+    {
+        let cache_rc = core.cache_rc();
+        let mut cache = cache_rc.try_borrow_mut().map_err(|_| {
+            anyhow::anyhow!(
+                "Cannot submit order {}: cache is currently borrowed",
+                order.client_order_id()
+            )
+        })?;
+        cache.add_order(order.clone(), position_id, client_id, true)?;
+    }
+
+    publish_order_initialized(order);
+
+    let command = SubmitOrder::new(
+        trader_id,
+        client_id,
+        strategy_id,
+        order.instrument_id(),
+        order.client_order_id(),
+        order.init_event().clone(),
+        order.exec_algorithm_id(),
+        position_id,
+        params,
+        UUID4::new(),
+        ts_init,
+        None, // correlation_id
+    );
+
+    if order.emulation_trigger().is_some() {
+        send_emulator_command(TradingCommand::SubmitOrder(command));
+    } else if let Some(exec_algorithm_id) = order.exec_algorithm_id() {
+        send_algo_command(command, exec_algorithm_id);
+    } else {
+        send_risk_command(TradingCommand::SubmitOrder(command));
+    }
+
+    strategy.set_gtd_expiry(order)?;
+    Ok(())
 }
 
 fn publish_order_initialized(order: &OrderAny) {
@@ -2426,7 +2474,7 @@ mod tests {
         },
         timer::{TimeEvent, TimeEventCallback},
     };
-    use nautilus_core::UnixNanos;
+    use nautilus_core::{DurationNanos, UnixNanos};
     use nautilus_model::{
         enums::{
             ContingencyType, LiquiditySide, OrderSide, OrderStatus, OrderType,
@@ -2963,7 +3011,7 @@ mod tests {
             realized_return: 0.0,
             realized_pnl: None,
             unrealized_pnl: Money::zero(currency),
-            duration: 0,
+            duration: DurationNanos::default(),
             event_id: UUID4::default(),
             ts_opened: UnixNanos::default(),
             ts_closed: None,
@@ -3005,6 +3053,82 @@ mod tests {
         assert!(strategy.is_registered());
         let _ = strategy.order().generate_client_order_id();
         let _ = strategy.portfolio().is_initialized();
+    }
+
+    #[rstest]
+    fn test_set_external_order_instrument_ids_replaces_claims_atomically() {
+        let mut strategy = create_test_strategy();
+        register_strategy(&mut strategy);
+        let cache = strategy.core.cache_rc();
+        let strategy_id = StrategyId::from("TEST-001");
+        let other_strategy_id = StrategyId::from("OTHER-001");
+        let audusd = InstrumentId::from("AUDUSD.SIM");
+        let eurusd = InstrumentId::from("EURUSD.SIM");
+        let gbpusd = InstrumentId::from("GBPUSD.SIM");
+
+        strategy
+            .set_external_order_instrument_ids(vec![audusd, eurusd])
+            .unwrap();
+        cache
+            .borrow_mut()
+            .set_external_order_claims(other_strategy_id, &[gbpusd])
+            .unwrap();
+
+        let result = strategy.set_external_order_instrument_ids(vec![eurusd, gbpusd]);
+
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "External order claim for GBPUSD.SIM already exists for OTHER-001"
+        );
+        assert_eq!(
+            cache.borrow().external_order_claim(&audusd),
+            Some(strategy_id)
+        );
+        assert_eq!(
+            cache.borrow().external_order_claim(&eurusd),
+            Some(strategy_id)
+        );
+        assert_eq!(
+            cache.borrow().external_order_claim(&gbpusd),
+            Some(other_strategy_id)
+        );
+        assert_eq!(
+            strategy.core.config.external_order_instrument_ids,
+            Some(vec![audusd, eurusd])
+        );
+
+        strategy
+            .set_external_order_instrument_ids(vec![eurusd])
+            .unwrap();
+
+        assert_eq!(cache.borrow().external_order_claim(&audusd), None);
+        assert_eq!(
+            cache.borrow().external_order_claim(&eurusd),
+            Some(strategy_id)
+        );
+        assert_eq!(
+            cache.borrow().external_order_claim(&gbpusd),
+            Some(other_strategy_id)
+        );
+        assert_eq!(
+            strategy.core.config.external_order_instrument_ids,
+            Some(vec![eurusd])
+        );
+    }
+
+    #[rstest]
+    fn test_set_external_order_instrument_ids_rejects_unregistered_strategy() {
+        let mut strategy = create_test_strategy();
+
+        let error = strategy
+            .set_external_order_instrument_ids(vec![InstrumentId::from("AUDUSD.SIM")])
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Strategy TEST-001 is not registered with a trader"
+        );
+        assert!(strategy.core.config.external_order_instrument_ids.is_none());
     }
 
     #[rstest]
@@ -5769,7 +5893,7 @@ mod tests {
         let strategy = TestStrategy::new(config);
 
         assert_eq!(
-            strategy.core.market_exit_timer_name.as_str(),
+            strategy.core.market_exit_timer_name,
             "MARKET_EXIT_CHECK:MY-STRATEGY-001"
         );
     }
@@ -6317,7 +6441,7 @@ mod tests {
     }
 
     nautilus_strategy!(MacroTestCustomField, inner, {
-        fn external_order_claims(&self) -> Option<Vec<InstrumentId>> {
+        fn external_order_instrument_ids(&self) -> Option<Vec<InstrumentId>> {
             None
         }
     });
@@ -6364,6 +6488,6 @@ mod tests {
         assert_eq!(custom.strategy_id(), config.strategy_id);
         assert_eq!(custom.config().order_id_tag, config.order_id_tag);
         assert_eq!(custom.actor_id(), ActorId::from("MACRO-001"));
-        assert!(custom.external_order_claims().is_none());
+        assert!(custom.external_order_instrument_ids().is_none());
     }
 }

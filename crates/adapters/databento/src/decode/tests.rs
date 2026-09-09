@@ -1104,7 +1104,10 @@ fn test_decode_ohlcv_msg() {
     assert_eq!(bar.low, Price::from("372025.00"));
     assert_eq!(bar.close, Price::from("372050.00"));
     assert_eq!(bar.volume, quantity_from_str("57"));
-    assert_eq!(bar.ts_event, msg.hd.ts_event + BAR_CLOSE_ADJUSTMENT_1S); // timestamp_on_close=true
+    assert_eq!(
+        bar.ts_event,
+        UnixNanos::from(msg.hd.ts_event) + BAR_CLOSE_ADJUSTMENT_1S
+    ); // timestamp_on_close=true
     assert_eq!(bar.ts_init, 0); // ts_init was Some(0)
 }
 
@@ -1152,7 +1155,7 @@ fn test_decode_definition_msg_futures_contract() {
     assert_eq!(future.id, instrument_id);
     assert_eq!(future.raw_symbol.as_str(), "ESU6");
     assert_eq!(future.asset_class, AssetClass::Index);
-    assert_eq!(future.underlying.as_str(), "ES");
+    assert_eq!(future.underlying, "ES");
     assert_eq!(future.currency, Currency::from("USD"));
     assert_eq!(future.price_precision, 2);
     assert_eq!(future.price_increment, Price::from("0.25"));
@@ -1179,8 +1182,8 @@ fn test_decode_definition_msg_futures_spread() {
     assert_eq!(spread.id, instrument_id);
     assert_eq!(spread.raw_symbol.as_str(), "ESU6-ESM7");
     assert_eq!(spread.asset_class, AssetClass::Index);
-    assert_eq!(spread.underlying.as_str(), "ES");
-    assert_eq!(spread.strategy_type.as_str(), "EQ");
+    assert_eq!(spread.underlying, "ES");
+    assert_eq!(spread.strategy_type, "EQ");
     assert_eq!(spread.currency, Currency::from("USD"));
     assert_eq!(spread.price_precision, 2);
     assert_eq!(spread.price_increment, Price::from("0.05"));
@@ -1209,7 +1212,7 @@ fn test_decode_definition_msg_option_contract() {
     assert_eq!(call.asset_class, AssetClass::Commodity);
     assert_eq!(call.option_kind, OptionKind::Call);
     assert_eq!(call.strike_price, Price::from("9600.00"));
-    assert_eq!(call.underlying.as_str(), "ESU6");
+    assert_eq!(call.underlying, "ESU6");
     assert_eq!(call.currency, Currency::from("USD"));
     assert_eq!(call.multiplier, quantity(50));
     // GLBX expirations carry an accurate intraday time (2026-09-18 13:30 UTC) and must not be
@@ -1254,7 +1257,7 @@ fn test_decode_definition_msg_option_spread() {
     assert_eq!(spread.id, spread_id);
     assert_eq!(spread.raw_symbol.as_str(), "UD:2E: SG 2500275");
     assert_eq!(spread.asset_class, AssetClass::Commodity);
-    assert_eq!(spread.strategy_type.as_str(), "SG");
+    assert_eq!(spread.strategy_type, "SG");
     assert_eq!(spread.currency, Currency::from("USD"));
     assert_eq!(spread.multiplier, quantity(1));
     assert_eq!(spread.ts_init, 0);
@@ -1270,7 +1273,7 @@ fn test_decode_definition_msg_option_spread() {
     };
     assert_eq!(mixed.id, mixed_id);
     assert_eq!(mixed.raw_symbol.as_str(), "UD:T$:CFO 2632896");
-    assert_eq!(mixed.strategy_type.as_str(), "CV:FO");
+    assert_eq!(mixed.strategy_type, "CV:FO");
 }
 
 #[rstest]
@@ -1735,7 +1738,7 @@ fn test_decode_mbp10_msg_with_undefined_levels() {
     assert_eq!(depth.asks[7].price.precision, 0);
     assert_eq!(depth.asks[7].size.raw, 0);
 
-    // Defined neighbours keep their normal side and instrument precision
+    // Defined neighbors keep their normal side and instrument precision
     assert_eq!(depth.bids[0].side, Some(OrderSide::Buy));
     assert_eq!(depth.bids[0].price.precision, 2);
     assert_eq!(depth.asks[0].side, Some(OrderSide::Sell));

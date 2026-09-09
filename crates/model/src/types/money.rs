@@ -21,6 +21,10 @@
 //!
 //! # Arithmetic behavior
 //!
+//! Adding or subtracting two `Money` values requires matching effective fixed-point scales.
+//! These operations panic on a scale mismatch.
+//! Comparisons and hashes account for scale differences without rounding.
+//!
 //! | Operation         | Result    | Notes                             |
 //! |-------------------|-----------|-----------------------------------|
 //! | `Money + Money`   | `Money`   | Panics if currencies don't match. |
@@ -34,6 +38,13 @@
 //! | `Money * f64`     | `f64`     |                                   |
 //! | `Money / f64`     | `f64`     |                                   |
 //! | `-Money`          | `Money`   |                                   |
+//!
+//! # Ordering behavior
+//!
+//! Rust ordering compares currency codes lexicographically, then scale-adjusted amounts.
+//! This order supports sorting and ordered collections across currencies, but it does not convert
+//! amounts to a common currency. Values with the same currency code compare by numeric value.
+//! Python comparisons reject values with different currency codes.
 //!
 //! # Currency constraints
 //!
@@ -71,8 +82,8 @@ use crate::types::fixed::MAX_FLOAT_PRECISION;
 use crate::types::{
     Currency,
     fixed::{
-        FIXED_PRECISION, FIXED_SCALAR, check_fixed_precision, mantissa_exponent_to_fixed_i128,
-        raw_scale, raw_scales_match, scaled_raw_to_decimal,
+        FIXED_PRECISION, FIXED_SCALAR, canonical_raw, check_fixed_precision, compare_raw_signed,
+        mantissa_exponent_to_fixed_i128, raw_scale, raw_scales_match, scaled_raw_to_decimal,
     },
 };
 
@@ -528,14 +539,15 @@ impl From<&Money> for f64 {
 
 impl Hash for Money {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.raw.hash(state);
+        self.raw.signum().hash(state);
+        canonical_raw(self.raw.unsigned_abs(), self.currency.precision).hash(state);
         self.currency.hash(state);
     }
 }
 
 impl PartialEq for Money {
     fn eq(&self, other: &Self) -> bool {
-        self.raw == other.raw && self.currency == other.currency
+        self.cmp(other) == Ordering::Equal
     }
 }
 
@@ -543,32 +555,18 @@ impl PartialOrd for Money {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
-
-    fn lt(&self, other: &Self) -> bool {
-        assert_eq!(self.currency, other.currency);
-        self.raw.lt(&other.raw)
-    }
-
-    fn le(&self, other: &Self) -> bool {
-        assert_eq!(self.currency, other.currency);
-        self.raw.le(&other.raw)
-    }
-
-    fn gt(&self, other: &Self) -> bool {
-        assert_eq!(self.currency, other.currency);
-        self.raw.gt(&other.raw)
-    }
-
-    fn ge(&self, other: &Self) -> bool {
-        assert_eq!(self.currency, other.currency);
-        self.raw.ge(&other.raw)
-    }
 }
 
 impl Ord for Money {
     fn cmp(&self, other: &Self) -> Ordering {
-        assert_eq!(self.currency, other.currency);
-        self.raw.cmp(&other.raw)
+        self.currency.code.cmp(&other.currency.code).then_with(|| {
+            compare_raw_signed(
+                self.raw,
+                self.currency.precision,
+                other.raw,
+                other.currency.precision,
+            )
+        })
     }
 }
 
@@ -590,6 +588,10 @@ impl Add for Money {
             "Currency mismatch: cannot add {} to {}",
             rhs.currency.code, self.currency.code
         );
+        assert!(
+            raw_scales_match(self.currency.precision, rhs.currency.precision),
+            "Cannot add `Money` values with mismatched decimal scales"
+        );
         Self {
             raw: self
                 .raw
@@ -607,6 +609,10 @@ impl Sub for Money {
             self.currency, rhs.currency,
             "Currency mismatch: cannot subtract {} from {}",
             rhs.currency.code, self.currency.code
+        );
+        assert!(
+            raw_scales_match(self.currency.precision, rhs.currency.precision),
+            "Cannot subtract `Money` values with mismatched decimal scales"
         );
         Self {
             raw: self
@@ -1000,10 +1006,66 @@ mod tests {
         assert!(m2 > m1);
         assert!(m1 <= m2);
         assert!(m2 >= m1);
+        assert_eq!(m1.cmp(&m2), Ordering::Less);
+        assert_eq!(m2.cmp(&m1), Ordering::Greater);
 
         // Equality
         let m3 = Money::new(100.0, usd);
         assert_eq!(m1, m3);
+    }
+
+    #[rstest]
+    fn test_money_ordering_is_structural_across_currencies() {
+        use std::collections::BTreeSet;
+
+        let aud_low = Money::new(-1.0, Currency::AUD());
+        let aud_high = Money::new(100.0, Currency::AUD());
+        let usd_low = Money::new(-100.0, Currency::USD());
+        let usd_high = Money::new(1.0, Currency::USD());
+
+        assert_eq!(aud_high.cmp(&usd_low), Ordering::Less);
+        assert_eq!(aud_high.partial_cmp(&usd_low), Some(Ordering::Less));
+        assert_eq!(
+            (
+                aud_high < usd_low,
+                aud_high <= usd_low,
+                aud_high > usd_low,
+                aud_high >= usd_low,
+                usd_low < aud_high,
+                usd_low <= aud_high,
+                usd_low > aud_high,
+                usd_low >= aud_high,
+            ),
+            (true, true, false, false, false, false, true, true),
+        );
+
+        let expected = vec![aud_low, aud_high, usd_low, usd_high];
+        let mut sorted = vec![usd_high, aud_high, usd_low, aud_low];
+        sorted.sort();
+        let ordered = BTreeSet::from([usd_high, aud_high, usd_low, aud_low]);
+
+        assert_eq!(sorted, expected);
+        assert_eq!(ordered.into_iter().collect::<Vec<_>>(), expected);
+    }
+
+    #[rstest]
+    fn test_money_cmp_equal_matches_equality() {
+        use crate::enums::CurrencyType;
+
+        let currency = Currency::new("TST", 2, 1, "Test fiat", CurrencyType::Fiat);
+        let same_code = Currency::new("TST", 8, 2, "Test crypto", CurrencyType::Crypto);
+        let other_code = Currency::new("TSU", 2, 1, "Other fiat", CurrencyType::Fiat);
+        let money = Money::from_raw(1, currency);
+        let cases = [
+            (Money::from_raw(1, same_code), true),
+            (Money::from_raw(2, same_code), false),
+            (Money::from_raw(1, other_code), false),
+        ];
+
+        for (other, expected_equal) in cases {
+            assert_eq!(money == other, expected_equal);
+            assert_eq!(money.cmp(&other) == Ordering::Equal, expected_equal);
+        }
     }
 
     #[rstest]
@@ -1163,7 +1225,7 @@ mod tests {
     #[rstest]
     fn test_money_new_usd() {
         let money = Money::new(1000.0, Currency::USD());
-        assert_eq!(money.currency.code.as_str(), "USD");
+        assert_eq!(money.currency.code, "USD");
         assert_eq!(money.currency.precision, 2);
         assert_eq!(money.to_string(), "1000.00 USD");
         assert_eq!(money.to_formatted_string(), "1_000.00 USD");
@@ -1174,7 +1236,7 @@ mod tests {
     #[rstest]
     fn test_money_new_btc() {
         let money = Money::new(10.3, Currency::BTC());
-        assert_eq!(money.currency.code.as_str(), "BTC");
+        assert_eq!(money.currency.code, "BTC");
         assert_eq!(money.currency.precision, 8);
         assert_eq!(money.to_string(), "10.30000000 BTC");
         assert_eq!(money.to_formatted_string(), "10.30000000 BTC");
@@ -1686,21 +1748,19 @@ mod property_tests {
             money1 in money_strategy(),
             money2 in money_strategy(),
         ) {
-            if money1.currency == money2.currency {
-                let eq = money1 == money2;
-                let lt = money1 < money2;
-                let gt = money1 > money2;
-                let le = money1 <= money2;
-                let ge = money1 >= money2;
+            let eq = money1 == money2;
+            let lt = money1 < money2;
+            let gt = money1 > money2;
+            let le = money1 <= money2;
+            let ge = money1 >= money2;
 
-                let exclusive_count = [eq, lt, gt].iter().filter(|&&x| x).count();
-                prop_assert_eq!(exclusive_count, 1, "Exactly one of ==, <, > should be true");
+            let exclusive_count = [eq, lt, gt].iter().filter(|&&x| x).count();
+            prop_assert_eq!(exclusive_count, 1, "Exactly one of ==, <, > should be true");
 
-                prop_assert_eq!(le, eq || lt, "<= should equal == || <");
-                prop_assert_eq!(ge, eq || gt, ">= should equal == || >");
-                prop_assert_eq!(lt, money2 > money1, "< should be symmetric with >");
-                prop_assert_eq!(le, money2 >= money1, "<= should be symmetric with >=");
-            }
+            prop_assert_eq!(le, eq || lt, "<= should equal == || <");
+            prop_assert_eq!(ge, eq || gt, ">= should equal == || >");
+            prop_assert_eq!(lt, money2 > money1, "< should be symmetric with >");
+            prop_assert_eq!(le, money2 >= money1, "<= should be symmetric with >=");
         }
 
         #[rstest]

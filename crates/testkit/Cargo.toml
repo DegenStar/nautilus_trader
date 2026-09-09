@@ -1,6 +1,5 @@
 [package]
 name = "nautilus-testkit"
-readme = "README.md"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -32,7 +31,6 @@ datasets = [
   "dep:nautilus-serialization",
   "dep:parquet",
   "dep:rand",
-  "dep:reqwest",
   "dep:serde_json",
 ]
 testers = [
@@ -103,7 +101,6 @@ log = { workspace = true, optional = true }
 parking_lot = { workspace = true }
 parquet = { workspace = true, features = ["zstd"], optional = true }
 rand = { workspace = true, optional = true }
-reqwest = { workspace = true, features = ["blocking"], optional = true }
 rust_decimal = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
@@ -127,14 +124,14 @@ serde_json = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 
-[[test]]
-name = "common"
+[[bin]]
+name = "prepare-test-data"
+path = "bin/prepare_test_data.rs"
 required-features = ["datasets"]
+test = false
+doc = false
 
 [[test]]
-name = "large_data"
-required-features = ["datasets"]
-
-[[test]]
-name = "orderbook_integration"
+name = "integration"
+path = "tests/integration/main.rs"
 required-features = ["datasets"]

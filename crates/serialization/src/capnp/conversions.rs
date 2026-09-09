@@ -18,6 +18,7 @@
 use std::error::Error;
 
 use indexmap::IndexMap;
+use nautilus_core::DurationNanos;
 use nautilus_model::{
     data::{
         FundingRateUpdate, IndexPriceUpdate, InstrumentClose, InstrumentStatus, MarkPriceUpdate,
@@ -2923,6 +2924,10 @@ impl<'a> ToCapnp<'a> for OrderCanceled {
         self.account_id
             .write_capnp(|| builder.reborrow().init_account_id());
 
+        if let Some(reason) = self.reason {
+            builder.reborrow().set_reason(reason.as_str());
+        }
+
         let event_id_builder = builder.reborrow().init_event_id();
         self.event_id.to_capnp(event_id_builder);
 
@@ -2960,6 +2965,12 @@ impl<'a> FromCapnp<'a> for OrderCanceled {
         let account_id =
             read_optional_from_capnp(|| reader.has_account_id(), || reader.get_account_id())?;
 
+        let reason = if reader.has_reason() {
+            Some(Ustr::from(reader.get_reason()?.to_str()?))
+        } else {
+            None
+        };
+
         let event_id_reader = reader.get_event_id()?;
         let event_id = nautilus_core::UUID4::from_capnp(event_id_reader)?;
 
@@ -2982,6 +2993,7 @@ impl<'a> FromCapnp<'a> for OrderCanceled {
             ts_event: ts_event.into(),
             ts_init: ts_init.into(),
             reconciliation,
+            reason,
             causation_id: None,
         })
     }
@@ -4510,7 +4522,7 @@ impl<'a> ToCapnp<'a> for PositionClosed {
         let unrealized_pnl_builder = builder.reborrow().init_unrealized_pnl();
         self.unrealized_pnl.to_capnp(unrealized_pnl_builder);
 
-        builder.set_duration(self.duration);
+        builder.set_duration(self.duration.as_u64());
 
         let event_id_builder = builder.reborrow().init_event_id();
         self.event_id.to_capnp(event_id_builder);
@@ -4590,7 +4602,7 @@ impl<'a> FromCapnp<'a> for PositionClosed {
         let unrealized_pnl_reader = reader.get_unrealized_pnl()?;
         let unrealized_pnl = Money::from_capnp(unrealized_pnl_reader)?;
 
-        let duration = reader.get_duration();
+        let duration = DurationNanos::new(reader.get_duration());
 
         let event_id_reader = reader.get_event_id()?;
         let event_id = nautilus_core::UUID4::from_capnp(event_id_reader)?;
@@ -4749,7 +4761,7 @@ impl<'a> FromCapnp<'a> for PositionAdjusted {
 #[cfg(test)]
 mod tests {
     use capnp::message::Builder;
-    use nautilus_core::{UUID4, UnixNanos};
+    use nautilus_core::{DurationNanos, UUID4, UnixNanos};
     use nautilus_model::{
         data::stubs::*,
         events::order::{
@@ -5366,6 +5378,20 @@ mod tests {
         );
     }
 
+    #[rstest]
+    fn order_canceled_none_reason_capnp_roundtrip() {
+        let event = OrderCanceled {
+            reason: None,
+            ..sample_order_canceled()
+        };
+        assert_capnp_roundtrip!(
+            event,
+            order_capnp::order_canceled::Builder,
+            order_capnp::order_canceled::Reader,
+            OrderCanceled
+        );
+    }
+
     // Position event coverage
     #[rstest]
     fn position_opened_capnp_roundtrip() {
@@ -5527,6 +5553,7 @@ mod tests {
             .reconciliation(true)
             .venue_order_id(venue_order_id())
             .account_id(account_id())
+            .reason(Ustr::from("not-enough-liquidity"))
             .build()
     }
 
@@ -5637,7 +5664,7 @@ mod tests {
             realized_return: 0.025,
             realized_pnl: Some(Money::new(1000.0, Currency::USD())),
             unrealized_pnl: Money::new(0.0, Currency::USD()),
-            duration: 1_000_000,
+            duration: DurationNanos::from_millis(1),
             event_id: uuid4(),
             ts_opened: UnixNanos::from(14),
             ts_closed: Some(UnixNanos::from(15)),

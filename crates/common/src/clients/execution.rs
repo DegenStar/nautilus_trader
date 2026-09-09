@@ -17,9 +17,7 @@
 
 use anyhow::Context;
 use async_trait::async_trait;
-use nautilus_core::{
-    Params, UnixNanos, datetime::checked_mins_to_nanos, time::get_atomic_clock_realtime,
-};
+use nautilus_core::{DurationNanos, Params, UnixNanos, time::get_atomic_clock_realtime};
 use nautilus_model::{
     accounts::AccountAny,
     enums::{LiquiditySide, OmsType},
@@ -27,7 +25,6 @@ use nautilus_model::{
         AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, Venue, VenueOrderId,
     },
     instruments::InstrumentAny,
-    orders::OrderAny,
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
     types::{AccountBalance, MarginBalance, Money, Price, Quantity},
 };
@@ -73,18 +70,6 @@ pub trait ExecutionClient {
     /// the instrument's exchange venue.
     fn handles_order_venue(&self, venue: Venue) -> bool {
         self.venue() == venue
-    }
-
-    /// Returns whether this client, for this exact command and cached order, will use a
-    /// downstream execution path that prevents any execution which would increase or reverse the
-    /// position once it reaches flat.
-    ///
-    /// The guarantee may be native venue enforcement or matching-engine enforcement against
-    /// execution-time position state. Serializing a flag the venue ignores, selecting a nominal
-    /// closing side, relying on balance rejection, or checking a cached position before submission
-    /// is not sufficient because an in-flight fill can make that check stale.
-    fn enforces_reduce_only(&self, _command: &SubmitOrder, _order: &OrderAny) -> bool {
-        false
     }
 
     /// Returns whether a bulk position status report request provides complete coverage for the
@@ -334,14 +319,9 @@ pub trait ExecutionClient {
     ) -> anyhow::Result<Option<ExecutionMassStatus>> {
         let ts_init = get_atomic_clock_realtime().get_time_ns();
         let start = lookback_mins
-            .map(|mins| {
-                checked_mins_to_nanos(mins)
-                    .map(|lookback_ns| {
-                        UnixNanos::from(ts_init.as_u64().saturating_sub(lookback_ns))
-                    })
-                    .ok_or_else(|| anyhow::anyhow!("lookback minutes overflow nanoseconds: {mins}"))
-            })
-            .transpose()?;
+            .map(DurationNanos::try_from_mins)
+            .transpose()?
+            .map(|lookback| ts_init.saturating_sub(lookback));
 
         let order_cmd = GenerateOrderStatusReportsBuilder::default()
             .ts_init(ts_init)
@@ -771,12 +751,9 @@ mod tests {
         assert_ne!(test_fill_report().ts_init, mass_status.ts_init);
         assert_ne!(test_position_report().ts_init, mass_status.ts_init);
 
-        let expected_start = UnixNanos::from(
-            mass_status
-                .ts_init
-                .as_u64()
-                .saturating_sub(checked_mins_to_nanos(5).unwrap()),
-        );
+        let expected_start = mass_status
+            .ts_init
+            .saturating_sub(DurationNanos::from_mins(5));
         assert_eq!(order_cmd.start, Some(expected_start));
         assert_eq!(fill_cmd.start, Some(expected_start));
         assert_eq!(position_cmd.start, Some(expected_start));

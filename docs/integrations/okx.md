@@ -377,8 +377,14 @@ for linear perpetual swap products on OKX.
 OKX WebSocket order operations use `instIdCode` (a numeric instrument identifier)
 instead of the string `instId` parameter. The adapter resolves `instIdCode` values
 from the instrument definitions fetched during startup and caches them for the
-session lifetime. If the instrument cache is empty (e.g. because of a failed
-bootstrap), order submissions fail with a clear error.
+session lifetime. Order submissions fail with a clear error if the required
+`instIdCode` is missing from the cache.
+
+The initial execution connection requires usable instruments from every requested
+instrument type or family. A failed request or a scope with no usable instruments
+aborts the connection before WebSockets open, even if another scope succeeds.
+Pre-open instruments and entries that cannot be parsed do not satisfy this
+requirement. Options without configured instrument families remain skipped.
 
 ### Client order ID requirements
 
@@ -448,10 +454,17 @@ Relevant OKX docs:
 
 ### Execution instructions
 
-| Instruction   | Linear perpetual swap | Notes                                                                             |
-| ------------- | --------------------- | --------------------------------------------------------------------------------- |
-| `post_only`   | ✓                     | Only for limit orders.                                                            |
-| `reduce_only` | ✓                     | Futures and swaps need `net` mode; margin needs `isolated` or `cross` trade mode. |
+| Instruction   | Linear perpetual swap | Notes                                                 |
+| ------------- | --------------------- | ----------------------------------------------------- |
+| `post_only`   | ✓                     | Only for limit orders.                                |
+| `reduce_only` | ✓                     | See the product and position-mode restrictions below. |
+
+The adapter sends OKX's literal `reduceOnly` field for margin orders in `isolated` or `cross`
+trade mode and for futures or swap orders in `net` position mode. In `long/short` position mode,
+OKX does not accept that field. The adapter uses the closing `side` and `posSide` combination as
+the enforcing venue instruction instead. It rejects reduce-only orders for cash, option, and event
+products, and rejects a long/short-mode combination that would increase the selected side. See
+OKX's [place order documentation](https://www.okx.com/docs-v5/en/#order-book-trading-trade-post-place-order).
 
 ### Time in force
 
@@ -802,7 +815,8 @@ Greeks.
 
 ### Restrictions
 
-- `reduce_only` is not applicable to options and is automatically stripped.
+- Reduce-only option orders are rejected by the adapter because OKX does not support the
+  instruction for options.
 - Position side defaults to `Net`.
 
 ### Configuration
@@ -867,10 +881,9 @@ order = strategy.order_factory.limit(
 strategy.submit_order(order)
 ```
 
-OKX requires `outcome` for `EVENTS` orders. It also requires `speedBump=1` for
-non-post-only event contract orders and amendments. The adapter validates `outcome`
-before sending the order and defaults `speedBump` to `1` for non-post-only event
-orders when it is not supplied.
+OKX requires `outcome` for `EVENTS` orders, which the adapter validates before
+sending. OKX ignores the obsolete `speedBump` request parameter, so the adapter
+omits it. Remove `speed_bump` from existing client calls and order `params`.
 
 Settlement fills arrive with OKX order category `delivery`. The adapter parses this
 category during live order updates and reconciliation.
@@ -880,6 +893,7 @@ Upstream references:
 - [Event contract REST endpoints](https://www.okx.com/docs-v5/en/#public-data-rest-api-get-series).
 - [WS channel](https://www.okx.com/docs-v5/en/#public-data-websocket-event-contract-markets-channel).
 - [Place order request fields](https://www.okx.com/docs-v5/en/#order-book-trading-trade-post-place-order).
+- [Removal of `speedBump`](https://www.okx.com/docs-v5/log_en/#2026-07-24).
 
 ## Authentication
 

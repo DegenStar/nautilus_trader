@@ -376,7 +376,7 @@ impl Trader {
         exec_algorithm: &Py<PyAny>,
         actor_id: ActorId,
     ) -> anyhow::Result<ExecAlgorithmId> {
-        let exec_algorithm_id = ExecAlgorithmId::from(actor_id.inner().as_str());
+        let exec_algorithm_id = ExecAlgorithmId::new(actor_id.inner());
 
         if self.exec_algorithm_ids.contains(&exec_algorithm_id) {
             anyhow::bail!("Execution algorithm '{exec_algorithm_id}' is already registered");
@@ -595,7 +595,7 @@ fn create_config_instance<'py>(
                     let py_value = config_value_to_py(py, key, value)?;
 
                     if let Err(setattr_err) = instance.setattr(key, py_value) {
-                        log::warn!("Failed to set attribute {key}: {setattr_err}");
+                        anyhow::bail!("Failed to set attribute {key}: {setattr_err}");
                     }
                 }
 
@@ -625,6 +625,14 @@ fn config_value_to_py<'py>(
         && let Some(actor_id) = value.as_str()
     {
         return Ok(ActorId::new_checked(actor_id)?
+            .into_pyobject(py)?
+            .into_any());
+    }
+
+    if key == "strategy_id"
+        && let Some(strategy_id) = value.as_str()
+    {
+        return Ok(StrategyId::new_checked(strategy_id)?
             .into_pyobject(py)?
             .into_any());
     }

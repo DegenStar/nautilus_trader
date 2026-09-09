@@ -47,9 +47,10 @@
 //! - `python`: Enables Python bindings from [PyO3](https://pyo3.rs) and auto-enables `node` and
 //!   `streaming`.
 //! - `simulation`: Enables deterministic simulation testing with
-//!   [MadSim](https://github.com/madsim-rs/madsim).
+//!   [MadSim](https://crates.io/crates/madsim).
 //! - `streaming`: Enables the `nautilus-persistence` dependency for streaming configuration and
 //!   requires `node`.
+//! - `test-support`: Enables engine-wired execution support for adapter integration tests.
 //!
 //! # Lean adapter builds
 //!
@@ -133,6 +134,9 @@ pub mod node;
 
 #[cfg(feature = "python")]
 pub mod python;
+
+#[cfg(feature = "test-support")]
+pub mod testing;
 
 // Re-exports for adapters
 pub use execution::{emitter, emitter::ExecutionEventEmitter, manager};

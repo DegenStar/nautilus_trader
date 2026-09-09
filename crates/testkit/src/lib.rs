@@ -17,14 +17,14 @@
 //!
 //! The `nautilus-testkit` crate provides testing utilities including test data management,
 //! file handling, and common testing patterns. This crate supports robust testing workflows
-//! across the entire NautilusTrader ecosystem with automated data downloads and validation:
+//! across the entire NautilusTrader ecosystem with explicit data preparation and local-only loading:
 //!
-//! - **Test data management**: Automated downloading and caching of test datasets.
+//! - **Test data management**: Explicit downloading, checksum verification, and caching of test datasets before tests.
 //! - **File utilities**: File integrity verification with SHA-256 checksums.
 //! - **Path resolution**: Platform-agnostic test data path management.
 //! - **Precision handling**: Support for both 64-bit and 128-bit precision test data.
 //! - **Event collection**: Draining and correlating the data events a client emits.
-//! - **Common patterns**: Reusable test utilities and helper functions.
+//! - **Common patterns**: Reusable fixtures and test support.
 //!
 //! # NautilusTrader
 //!
@@ -42,7 +42,7 @@
 //!   loading.
 //! - `extension-module`: Builds as a Python extension module.
 //! - `high-precision`: Enables
-//!   [high-precision mode](https://nautilustrader.io/docs/nightly/getting_started/installation#precision-mode)
+//!   [high-precision mode](https://nautilustrader.io/docs/nightly/getting_started/installation/#precision-mode)
 //!   to use 128-bit value types.
 //! - `python`: Enables Python bindings from [PyO3](https://pyo3.rs).
 //! - `testers` (default): Enables test actors, strategies, and in-memory cache backing.

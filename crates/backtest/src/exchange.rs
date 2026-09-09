@@ -32,7 +32,7 @@ use nautilus_common::{
     msgbus::{self, MessagingSwitchboard, TypedHandler, switchboard},
 };
 use nautilus_core::{
-    UUID4, UnixNanos,
+    DurationNanos, UUID4, UnixNanos,
     correctness::{CorrectnessResultExt, FAILED, check_equal},
 };
 use nautilus_execution::{
@@ -203,10 +203,6 @@ impl Debug for SimulatedExchange {
 }
 
 impl SimulatedExchange {
-    pub(crate) const fn use_reduce_only(&self) -> bool {
-        self.use_reduce_only
-    }
-
     /// Creates a new [`SimulatedExchange`] instance from a venue configuration.
     ///
     /// # Errors
@@ -438,7 +434,8 @@ impl SimulatedExchange {
     /// # Errors
     ///
     /// Returns an error if:
-    /// - The exchange account type is `Cash` and the instrument is a `CryptoPerpetual` or `CryptoFuture`.
+    /// - The exchange account type is `Cash` and the instrument is a `CryptoPerpetual`,
+    ///   `CryptoFuture`, `FuturesContract`, or `PerpetualContract`.
     /// - The matching engine raw ID is exhausted.
     ///
     /// # Panics
@@ -456,6 +453,7 @@ impl SimulatedExchange {
         if self.account_type == AccountType::Cash
             && (matches!(instrument, InstrumentAny::CryptoPerpetual(_))
                 || matches!(instrument, InstrumentAny::CryptoFuture(_))
+                || matches!(instrument, InstrumentAny::FuturesContract(_))
                 || matches!(instrument, InstrumentAny::PerpetualContract(_)))
         {
             anyhow::bail!("Cash account cannot trade futures or perpetuals")
@@ -878,7 +876,7 @@ impl SimulatedExchange {
     ///
     /// Returns an error if module pre-processing or matching engine processing fails.
     pub fn process_order_book_delta(&mut self, delta: OrderBookDelta) -> anyhow::Result<()> {
-        self.pre_process_modules(&Data::Delta(delta))?;
+        self.pre_process_modules(&Data::BookDelta(delta))?;
 
         if !self.matching_engines.contains_key(&delta.instrument_id) {
             let instrument = {
@@ -910,7 +908,7 @@ impl SimulatedExchange {
     ///
     /// Returns an error if module pre-processing or matching engine processing fails.
     pub fn process_order_book_deltas(&mut self, deltas: &OrderBookDeltas) -> anyhow::Result<()> {
-        self.pre_process_modules(&Data::Deltas(Box::new(deltas.clone())))?;
+        self.pre_process_modules(&Data::BookDeltas(Box::new(deltas.clone())))?;
 
         if !self.matching_engines.contains_key(&deltas.instrument_id) {
             let instrument = {
@@ -942,7 +940,7 @@ impl SimulatedExchange {
     ///
     /// Returns an error if module pre-processing or matching engine processing fails.
     pub fn process_order_book_depth10(&mut self, depth: &OrderBookDepth10) -> anyhow::Result<()> {
-        self.pre_process_modules(&Data::Depth10(Box::new(*depth)))?;
+        self.pre_process_modules(&Data::BookDepth10(Box::new(*depth)))?;
 
         if !self.matching_engines.contains_key(&depth.instrument_id) {
             let instrument = {
@@ -1555,8 +1553,11 @@ impl SimulatedExchange {
         let Some(interval_mins) = funding_rate.interval else {
             return false;
         };
-        let interval_ns = u64::from(interval_mins) * 60 * 1_000_000_000;
-        interval_ns > 0 && funding_rate.ts_event.as_u64().is_multiple_of(interval_ns)
+        let Ok(interval) = DurationNanos::try_from_mins(u64::from(interval_mins)) else {
+            return false;
+        };
+
+        !interval.is_zero() && funding_rate.ts_event.floor(interval) == funding_rate.ts_event
     }
 
     fn funding_boundary(funding_rate: &FundingRateUpdate) -> Option<UnixNanos> {
@@ -2077,6 +2078,7 @@ impl Drop for DeferEventsGuard {
 #[cfg(test)]
 mod tests {
     use nautilus_common::messages::execution::{QueryAccount, QueryOrder, SubmitOrder};
+    use nautilus_core::DurationNanos;
     use nautilus_execution::models::latency::{LatencyModelHandle, StaticLatencyModel};
     use nautilus_model::{
         accounts::MarginAccount,
@@ -2118,10 +2120,10 @@ mod tests {
         match dispatch {
             Dispatch::Latency => {
                 config.latency_model = Some(LatencyModelHandle::new(StaticLatencyModel::new(
-                    UnixNanos::default(),
-                    UnixNanos::default(),
-                    UnixNanos::default(),
-                    UnixNanos::default(),
+                    DurationNanos::default(),
+                    DurationNanos::default(),
+                    DurationNanos::default(),
+                    DurationNanos::default(),
                 )));
             }
             Dispatch::Queued => {} // Defaults: use_message_queue = true, no latency

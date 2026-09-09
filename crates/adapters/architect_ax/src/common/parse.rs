@@ -115,7 +115,7 @@ const TRADE_ID_DOMAIN: &[u8] = b"nautilus-architect-ax/trade-id/v1";
 /// over the WebSocket.
 ///
 /// Parity relies on both transports reporting the aggressor side. `GET /trades` always does, and
-/// no sandbox WebSocket trade has omitted it, but `AxMdTrade::d` is modelled as optional and an
+/// no sandbox WebSocket trade has omitted it, but `AxMdTrade::d` is modeled as optional and an
 /// omitted side resolves to [`AggressorSide::NoAggressor`], which would not match the REST
 /// identity for that trade.
 ///
@@ -387,11 +387,11 @@ mod tests {
 
         let recovered = cid_to_client_order_id(cid_a);
         assert!(
-            recovered.inner().as_str().starts_with("CID-"),
+            recovered.inner().starts_with("CID-"),
             "recovered id should have CID prefix: {recovered}",
         );
         assert!(
-            !recovered.inner().as_str().is_empty(),
+            !recovered.inner().is_empty(),
             "recovered id should not be empty",
         );
     }

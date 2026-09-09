@@ -49,6 +49,7 @@ jobs:
     outputs:
       run-tests: ${{ steps.plan.outputs.run_tests }}
       run-rust-tests: ${{ steps.plan.outputs.run_rust_tests }}
+      github-changed: ${{ steps.plan.outputs.github_changed }}
       untrusted_pr: ${{ steps.policy.outputs.untrusted_pr }}
       publish_r2: ${{ steps.wheel-publication.outputs.publish_r2 }}
       publish_development: ${{ steps.wheel-publication.outputs.publish_development }}
@@ -100,7 +101,7 @@ jobs:
       contents: read
       actions: read
       security-events: write
-    uses: ./.github/workflows/security-audit.yml
+    uses: $/.github/workflows/security-audit.yml
     with:
       force: >-
         ${{
@@ -143,12 +144,25 @@ jobs:
         with:
           python-version: "3.14"
 
+      - name: Get uv version
+        id: uv-version
+        run: echo "uv_version=$(bash scripts/uv-version.sh)" >> "$GITHUB_OUTPUT"
+
+      - name: Install uv
+        # https://github.com/astral-sh/setup-uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: ${{ steps.uv-version.outputs.uv_version }}
+          enable-cache: false
+
       - name: Install ripgrep
         run: |
           sudo apt-get update -o Acquire::Retries=5
           sudo apt-get install -y ripgrep -o Acquire::Retries=5
 
       - name: Check GitHub Action pins
+        # One network round trip per pinned reference, so only when they changed
+        if: needs.plan.outputs.github-changed == 'true'
         run: make check-github-action-pins
 
       - name: Check Docker toolchain pins
@@ -194,7 +208,7 @@ jobs:
         && needs.plan.outputs.untrusted_pr != 'false'
         && 'ci-pr'
         || 'nextest' }}
-      # Scopes incremental clippy/doc checks; empty for non-PR/push events.
+      # Scopes changed-package Rust checks; empty for non-PR/push events.
       CHANGED_BASE_SHA: >-
         ${{ github.event.pull_request.base.sha || github.event.before }}
     steps:
@@ -221,7 +235,7 @@ jobs:
         run: bash scripts/ci/verify-ci-inputs.sh post-checkout
 
       - name: Common setup
-        uses: ./.github/actions/common-setup
+        uses: $/.github/actions/common-setup
         with:
           python-version: "3.13"
           # free-disk-space auto-skips on the nautilus-ci-runner-* pool.
@@ -349,7 +363,7 @@ jobs:
         run: bash scripts/ci/verify-ci-inputs.sh post-checkout
 
       - name: Common setup
-        uses: ./.github/actions/common-setup
+        uses: $/.github/actions/common-setup
         with:
           python-version: ${{ matrix.python-version }}
           # free-disk-space auto-skips on the nautilus-ci-runner-* pool.
@@ -411,7 +425,7 @@ jobs:
           bash scripts/ci/check-generated-drift.bash
 
       - name: Upload wheel artifact
-        uses: ./.github/actions/upload-artifact-wheel
+        uses: $/.github/actions/upload-artifact-wheel
         with:
           retention-days: ${{ github.ref_name == 'master' && '7' || '1' }}
 
@@ -494,7 +508,7 @@ jobs:
         run: bash scripts/ci/verify-ci-inputs.sh post-checkout
 
       - name: Common setup
-        uses: ./.github/actions/common-setup
+        uses: $/.github/actions/common-setup
         with:
           python-version: "3.13"
           free-disk-space: "true"
@@ -528,19 +542,10 @@ jobs:
           POSTGRES_DATABASE: nautilus
 
       - name: Cached test data
-        uses: ./.github/actions/common-test-data
+        uses: $/.github/actions/common-test-data
 
       - name: Report disk space before Rust tests
         run: bash scripts/ci/report-disk-space.bash "before Rust tests"
-
-      - name: Run Rust doctests
-        run: >-
-          make cargo-test-doc
-          EXTRA_FEATURES="capnp,hypersync,nautilus-serialization/sbe,nautilus-infrastructure/postgres"
-
-      - name: Report disk space after Rust doctests
-        if: always()
-        run: bash scripts/ci/report-disk-space.bash "after Rust doctests"
 
       - name: Run Rust tests
         run: >-
@@ -591,7 +596,8 @@ jobs:
           persist-credentials: false
 
       - name: Common setup
-        uses: ./.github/actions/common-setup
+        # Depot Windows/ARM runners need ./ until they support runner >=2.336.0
+        uses: ./.github/actions/common-setup # zizmor: ignore[self-repository]
         with:
           python-version: ${{ matrix.python-version }}
           free-disk-space: "true"
@@ -618,7 +624,8 @@ jobs:
         run: bash ../scripts/ci/test-wheel.bash
 
       - name: Upload wheel artifact
-        uses: ./.github/actions/upload-artifact-wheel
+        # Depot Windows/ARM runners need ./ until they support runner >=2.336.0
+        uses: ./.github/actions/upload-artifact-wheel # zizmor: ignore[self-repository]
         with:
           retention-days: ${{ github.ref_name == 'master' && '7' || '1' }}
 
@@ -661,7 +668,7 @@ jobs:
           persist-credentials: false
 
       - name: Common setup
-        uses: ./.github/actions/common-setup
+        uses: $/.github/actions/common-setup
         with:
           python-version: ${{ matrix.python-version }}
           free-disk-space: "true"
@@ -688,7 +695,7 @@ jobs:
         run: bash ../scripts/ci/test-wheel.bash
 
       - name: Upload wheel artifact
-        uses: ./.github/actions/upload-artifact-wheel
+        uses: $/.github/actions/upload-artifact-wheel
         with:
           retention-days: ${{ github.ref_name == 'master' && '7' || '1' }}
 
@@ -726,13 +733,17 @@ jobs:
           persist-credentials: false
 
       - name: Common setup
-        uses: ./.github/actions/common-setup
+        # Depot Windows/ARM runners need ./ until they support runner >=2.336.0
+        uses: ./.github/actions/common-setup # zizmor: ignore[self-repository]
         with:
           python-version: ${{ matrix.python-version }}
           free-disk-space: "true"
           rust-cache-key: build-windows
           rust-cache-workspaces: . -> target/build-windows
           rust-cache-save-if: ${{ github.event_name == 'push' }}
+
+      - name: Check native paths
+        run: bash scripts/test-native-path.bash
 
       - name: Update version in pyproject.toml
         if: ${{ github.ref != 'refs/heads/master' }}
@@ -753,7 +764,8 @@ jobs:
         run: bash ../scripts/ci/test-wheel.bash
 
       - name: Upload wheel artifact
-        uses: ./.github/actions/upload-artifact-wheel
+        # Depot Windows/ARM runners need ./ until they support runner >=2.336.0
+        uses: ./.github/actions/upload-artifact-wheel # zizmor: ignore[self-repository]
         with:
           retention-days: ${{ github.ref_name == 'master' && '7' || '1' }}
 
@@ -784,7 +796,7 @@ jobs:
           persist-credentials: false
 
       - name: Install cargo-audit
-        uses: ./.github/actions/cargo-tool-install
+        uses: $/.github/actions/cargo-tool-install
         with:
           tool-name: cargo-audit
 
@@ -935,7 +947,7 @@ jobs:
 
       # https://github.com/actions/attest-build-provenance
       - name: Attest wheel provenance
-        uses: ./.github/actions/attest-build-provenance-retry
+        uses: $/.github/actions/attest-build-provenance-retry
         with:
           subject-path: "dist/nautilus_trader-*.whl"
 
@@ -947,7 +959,7 @@ jobs:
         run: bash ./scripts/ci/verify-gh-attestations.bash dist/nautilus_trader-*.whl
 
       - name: Publish wheels to Cloudflare R2
-        uses: ./.github/actions/publish-wheels
+        uses: $/.github/actions/publish-wheels
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -979,7 +991,7 @@ jobs:
           persist-credentials: false
 
       - name: Install cargo-deny
-        uses: ./.github/actions/cargo-tool-install
+        uses: $/.github/actions/cargo-tool-install
         with:
           tool-name: cargo-deny
 
@@ -1009,7 +1021,7 @@ jobs:
           persist-credentials: false
 
       - name: Install cargo-vet
-        uses: ./.github/actions/cargo-tool-install
+        uses: $/.github/actions/cargo-tool-install
         with:
           tool-name: cargo-vet
 
@@ -1047,7 +1059,7 @@ jobs:
           persist-credentials: false
 
       - name: Common setup
-        uses: ./.github/actions/common-setup
+        uses: $/.github/actions/common-setup
         with:
           python-version: "3.13"
           build-type: "test"
@@ -1088,7 +1100,7 @@ jobs:
           persist-credentials: false
 
       - name: Common setup
-        uses: ./.github/actions/common-setup
+        uses: $/.github/actions/common-setup
         with:
           python-version: "3.13"
           free-disk-space: "true"
@@ -1234,7 +1246,7 @@ jobs:
           persist-credentials: false
 
       - name: Common setup
-        uses: ./.github/actions/common-setup
+        uses: $/.github/actions/common-setup
         with:
           python-version: "3.13"
           free-disk-space: "true"
@@ -1362,7 +1374,7 @@ jobs:
         run: bash ./scripts/ci/upload-github-release-assets.bash wheels dist/nautilus_trader-*.whl
 
       - name: Publish wheels to Cloudflare R2
-        uses: ./.github/actions/publish-wheels
+        uses: $/.github/actions/publish-wheels
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -1430,7 +1442,7 @@ jobs:
       # https://github.com/actions/attest-build-provenance
       - name: Attest wheel provenance
         id: attest-wheels
-        uses: ./.github/actions/attest-build-provenance-retry
+        uses: $/.github/actions/attest-build-provenance-retry
         with:
           subject-path: "dist/nautilus_trader-*.whl"
 
@@ -1492,7 +1504,7 @@ jobs:
           persist-credentials: false
 
       - name: Common setup
-        uses: ./.github/actions/common-setup
+        uses: $/.github/actions/common-setup
         with:
           python-version: "3.13"
           build-type: "release"
@@ -1585,7 +1597,7 @@ jobs:
       # https://github.com/actions/attest-build-provenance
       - name: Attest sdist provenance
         id: attest-sdist
-        uses: ./.github/actions/attest-build-provenance-retry
+        uses: $/.github/actions/attest-build-provenance-retry
         with:
           subject-path: "dist/nautilus_trader-*.tar.gz"
 

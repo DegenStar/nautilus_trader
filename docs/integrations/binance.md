@@ -160,6 +160,21 @@ BINANCE_FUTURES_INSTRUMENT_ID=BTCUSDT_260925.BINANCE \
   cargo run -p nautilus-binance --example binance-futures-data-tester --features examples
 ```
 
+## Spot notional constraints
+
+Spot instruments loaded through SBE or JSON populate the dedicated `min_notional` and
+`max_notional` fields from `MIN_NOTIONAL` and `NOTIONAL` filters. When both filters are present,
+the parser uses the strictest bounds. These fields hold quote-currency `Money` values at the
+currency's precision.
+
+The risk engine checks these instrument fields using its price estimates. Instrument `info` is
+metadata for downstream actors and strategies and does not affect risk decisions. Binance applies
+its market-order flags and reference-price rules when validating orders at the venue.
+
+PostgreSQL preserves instrument metadata when restoring instruments. After upgrading an existing
+database, run `nautilus database init --schema "$PWD/schema/sql"` from the repository root to add
+metadata storage. Previously discarded metadata requires reloading instrument definitions.
+
 ## Order capability
 
 The following tables detail order types, execution instructions, and
@@ -183,10 +198,16 @@ the venue rather than locally.
 
 ### Execution instructions
 
-| Instruction   | Spot | USDT Futures | Coin Futures | Notes                                 |
-| ------------- | ---- | ------------ | ------------ | ------------------------------------- |
-| `post_only`   | ✓    | ✓            | ✓            | See restrictions below.               |
-| `reduce_only` | -    | ✓            | ✓            | Futures only; disabled in Hedge Mode. |
+| Instruction   | Spot | USDT Futures | Coin Futures | Notes                                                     |
+| ------------- | ---- | ------------ | ------------ | --------------------------------------------------------- |
+| `post_only`   | ✓    | ✓            | ✓            | See restrictions below.                                   |
+| `reduce_only` | -    | ✓            | ✓            | Futures only; translated to `positionSide` in Hedge Mode. |
+
+In One-way Mode, the adapter sends Binance's `reduceOnly` field. Binance does not accept that
+field in Hedge Mode, so the adapter instead selects the closing `positionSide`. This keeps the
+order on the identified leg and prevents it from opening the opposite leg. See Binance's
+[New Order API](https://developers.binance.com/docs/derivatives/usds-margined-futures/trade/rest-api/New-Order)
+for the wire restrictions.
 
 #### Post-only restrictions
 
@@ -280,7 +301,8 @@ blindly retry a command after a timeout, network failure, or Binance unknown-sta
 the first request may have reached the matching engine. Retrying could create a duplicate order or
 apply a second amendment.
 
-- A definitive local validation error or venue rejection emits the matching rejection event.
+- Local submit validation emits `OrderDenied` before submission; local modify validation emits
+  `OrderModifyRejected`. A definitive venue rejection emits the matching rejection event.
 - An ambiguous transport result remains inflight and is resolved by the private stream or REST
   reconciliation. The adapter does not emit a false rejection while the venue outcome is unknown.
 - A Futures algo cancel may fall back from the pre-trigger algo endpoint to the regular-order
@@ -289,8 +311,15 @@ apply a second amendment.
 - Strategy code must not resubmit a command while its result is ambiguous. Wait for reconciliation
   or query the order by its client order ID.
 
-The configs do not expose retry controls for order commands because resending an ambiguous command
-could duplicate an order or amendment.
+`BinanceDataClientConfig` and `BinanceExecutionClientConfig` expose `max_retries`,
+`retry_delay_initial_ms`, and `retry_delay_max_ms` for HTTP GET requests. Transient read failures
+retry with bounded exponential backoff and fresh authentication fields. A venue `Retry-After`
+header sets the minimum delay, which can exceed `retry_delay_max_ms`. The fixed total retry budget
+is 180 seconds. When a required delay exceeds the remaining budget, the request returns the venue
+error without waiting.
+
+These settings do not retry order commands because resending an ambiguous command could duplicate
+an order or amendment.
 
 ### Position management
 
@@ -306,7 +335,7 @@ remaining rows, position report generation warns when an amount cannot be parsed
 positions are removed, unresolved instruments and other conversion failures also warn. If any
 position fails, `generate_position_status_reports` returns an error with the failure count instead
 of an incomplete report set. See
-[instrument availability](../concepts/reconciliation.md#instrument-availability).
+[instrument availability](../concepts/execution/reconciliation.md#instrument-availability).
 
 ### Risk events
 
@@ -343,8 +372,9 @@ Upstream references:
 The execution engine creates external orders from runtime status reports when
 the order is not already in cache. This covers first-seen exchange-generated
 orders (the typical case for a live liquidation or ADL event). The engine
-assigns the order to any strategy that has claimed the instrument via
-`external_order_claims`, or to the `EXTERNAL` strategy by default.
+assigns the order through the instrument's active external order claim,
+configured initially with `external_order_instrument_ids`, or to the `EXTERNAL`
+strategy by default.
 
 :::note
 The status report and fill report are emitted bundled as a single
@@ -386,7 +416,7 @@ time also requires a start time.
 For mass status, an unset `reconciliation_lookback_mins` or a value longer than the complete window
 applies that window. The returned `ExecutionMassStatus` sets `lookback_start` to the applied boundary
 and `reports_complete` to `false`; see the
-[mass-status history contract](../concepts/reconciliation.md#mass-status-history-contract). Binance
+[mass-status history contract](../concepts/execution/reconciliation.md#mass-status-history-contract). Binance
 Spot is unaffected. See the Binance
 [Futures change log](https://developers.binance.com/en/docs/products/derivatives-trading-usds-futures/change-log).
 
@@ -405,10 +435,10 @@ Customize individual orders by supplying a `params` dictionary when calling
 `Strategy.submit_order` (Python) or setting `Params` on a `SubmitOrder`
 command (Rust). The Binance execution clients recognize:
 
-| Parameter        | Type   | Products          | Purpose                                          | Restrictions                                                                     |
-| ---------------- | ------ | ----------------- | ------------------------------------------------ | -------------------------------------------------------------------------------- |
-| `price_match`    | `str`  | USDT/COIN Futures | Delegate price selection to Binance.             | `LIMIT` only; not with `post_only`.                                              |
-| `close_position` | `bool` | USDT/COIN Futures | Close the whole position when the trigger fires. | `StopMarket` and `MarketIfTouched` only; not with `reduce_only`, not in batches. |
+| Parameter        | Type   | Products          | Purpose                                          | Restrictions                                                                              |
+| ---------------- | ------ | ----------------- | ------------------------------------------------ | ----------------------------------------------------------------------------------------- |
+| `price_match`    | `str`  | USDT/COIN Futures | Delegate price selection to Binance.             | `LIMIT` only; not with `post_only`.                                                       |
+| `close_position` | `bool` | USDT/COIN Futures | Close the whole position when the trigger fires. | `StopMarket` and `MarketIfTouched` only; requires `reduce_only=true`; not in order lists. |
 
 See [Price match](#price-match) and [Close position](#close-position) for the full behavior.
 
@@ -478,13 +508,17 @@ the new price.
 
 Binance Futures conditional orders support `closePosition`, which closes the entire position
 when the trigger fires. Binance resolves the quantity server-side from the current position
-size at trigger time.
+size at trigger time. See the official
+[USD-M Algo Service API](https://developers.binance.com/docs/derivatives/usds-margined-futures/trade/rest-api/New-Algo-Order)
+and [COIN-M Algo Service API](https://developers.binance.com/docs/derivatives/coin-margined-futures/trade/rest-api/New-Algo-Order).
 
 Unlike `reduce_only`, `closePosition` adapts to position size changes, and Binance
 auto-cancels the order when the position is closed by other means.
 
-Pass `close_position` via the `params` dictionary on `StopMarket` or `MarketIfTouched` orders.
-Cannot be combined with `reduce_only`, and it is rejected for batch order submission.
+Set `reduce_only=true` on the Nautilus `StopMarket` or `MarketIfTouched` order, then pass
+`close_position=true` in its `params`. The reduce-only flag records the order's closing intent and
+is required for the order to pass while the trading state is `REDUCING`. The adapter translates
+this combination into Binance's close-all instruction and rejects `close_position` in order lists.
 
 Allow Binance whole-position exits in the risk engine configuration:
 
@@ -515,7 +549,11 @@ strategy.submit_order(
 ```
 
 :::info
-Nautilus omits `quantity` and `reduceOnly` from the API request when `close_position` is set.
+The Nautilus order must set `reduce_only=true`, but Binance does not permit its `reduceOnly` field
+with `closePosition=true`. The adapter therefore sends `closePosition=true` while omitting
+`quantity` and `reduceOnly` from the Binance request. In Hedge Mode, it also sends the closing
+`positionSide`.
+
 For an allowlisted venue, the risk engine still validates quantity precision and positivity,
 the trigger price, the order shape and side, and the linked open position. It does not apply
 minimum or maximum quantity and notional bounds to the placeholder quantity.
@@ -523,8 +561,8 @@ minimum or maximum quantity and notional bounds to the placeholder quantity.
 
 :::warning
 Only add a venue when its configured execution client enforces whole-position closing semantics.
-An unsupported client may ignore `close_position` and submit the placeholder as an ordinary
-quantity-bearing order.
+An execution client that does not interpret `close_position` may submit only the placeholder
+quantity through its standard reduce-only path instead of closing the whole position.
 :::
 
 ### Trailing stops
@@ -630,7 +668,9 @@ data WebSocket reconnect. The rebuild runs in this order:
 :::note
 This snapshot-and-buffer sequence applies to Futures and Spot `BookDeltas`
 subscriptions without an explicit depth. Spot partial-depth subscriptions deliver
-self-contained top-N snapshots. See [Spot market data mode](#spot-market-data-mode).
+self-contained top-N snapshots. SBE partial books require depth 20; use JSON market data
+for depth 5 or 10. Unsupported SBE partial depths are rejected before subscription.
+See [Spot market data mode](#spot-market-data-mode).
 :::
 
 ## Quote timestamps
@@ -873,7 +913,7 @@ info (e.g. after delisting or contract expiry), the adapter emits
 `NotAvailableForTrading`.
 
 Status polling does not reload instrument definitions. The separate
-`instrument_refresh_interval_secs` task performs a complete filtered catalogue load, atomically
+`instrument_refresh_interval_secs` task performs a complete filtered catalog load, atomically
 replaces the data-client and WebSocket lookup maps, sends the refreshed instruments to the data
 engine, and updates the status snapshot. It also refreshes the execution client precision cache.
 The default full refresh interval is 3,600 seconds; set it to `0` to disable it. Disconnect cancels
@@ -1040,10 +1080,13 @@ For the latest rate limits, query `/api/v3/exchangeInfo` (Spot) or `/fapi/v1/exc
 | `api_key` / `api_secret`           | `None`    | Required for Spot SBE; optional for public JSON and Futures data.              |
 | `spot_market_data_mode`            | `Sbe`     | `Json` keeps the credential-free Global Spot path. Binance US requires `Json`. |
 | `instrument_provider`              | default   | Loading, filters, parser-warning, and commission policy.                       |
-| `instrument_refresh_interval_secs` | `3,600`   | Full catalogue refresh interval; `0` disables it.                              |
+| `instrument_refresh_interval_secs` | `3,600`   | Full catalog refresh interval; `0` disables it.                                |
 | `instrument_status_poll_secs`      | `3,600`   | Status-only exchange-info poll interval; `0` disables it.                      |
 | `proxy_url`                        | `None`    | Proxy applied to HTTP and every market WebSocket connection.                   |
 | `recv_window_ms`                   | `5,000`   | Signed HTTP receive window, inclusive range `1..=60000`.                       |
+| `max_retries`                      | `3`       | Maximum retries for HTTP GET requests.                                         |
+| `retry_delay_initial_ms`           | `1,000`   | Initial HTTP read retry delay in milliseconds.                                 |
+| `retry_delay_max_ms`               | `10,000`  | Maximum exponential delay; a venue minimum can exceed it.                      |
 | `us`                               | `False`   | Route a live Spot JSON client to Binance US.                                   |
 | `transport_backend`                | `Sockudo` | WebSocket transport backend.                                                   |
 
@@ -1063,6 +1106,9 @@ For the latest rate limits, query `/api/v3/exchangeInfo` (Spot) or `/fapi/v1/exc
 | `instrument_refresh_interval_secs` | `3,600`   | Execution precision-cache refresh interval; `0` disables it.            |
 | `proxy_url`                        | `None`    | Proxy applied to HTTP, private streams, and WebSocket trading.          |
 | `recv_window_ms`                   | `5,000`   | Signed HTTP and WebSocket receive window, inclusive range `1..=60000`.  |
+| `max_retries`                      | `3`       | Maximum retries for HTTP GET requests.                                  |
+| `retry_delay_initial_ms`           | `1,000`   | Initial HTTP read retry delay in milliseconds.                          |
+| `retry_delay_max_ms`               | `10,000`  | Maximum exponential delay; a venue minimum can exceed it.               |
 | `us`                               | `False`   | Route a live Spot execution client to Binance US.                       |
 | `api_key` / `api_secret`           | `None`    | Global uses Ed25519 WebSocket auth; Binance US uses HMAC HTTP signing.  |
 | `use_gtd`                          | `True`    | Use native USD-M GTD; see [GTD policy](#gtd-policy).                    |
@@ -1393,7 +1439,7 @@ and the USD-M
 endpoint.
 
 Exact queries require credentials. Because they issue one private request per selected symbol,
-combine `load_ids` or filters with this option on large catalogues.
+combine `load_ids` or filters with this option on large catalogs.
 
 ### Parser warnings
 

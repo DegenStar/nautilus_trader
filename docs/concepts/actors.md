@@ -14,7 +14,10 @@ adds order-management capabilities.
 
 ## Basic Python example
 
-Actors support configuration through a pattern similar to strategies.
+Actors support configuration through a pattern similar to strategies. Declare custom fields as
+keyword-only arguments and accept `**_kwargs` so the base fields (`actor_id` and the log settings)
+pass through to `DataActorConfig.__new__`, which reads them from the same call. A positional
+argument would be matched against `actor_id` instead, raising a `TypeError`.
 
 ```python
 from nautilus_trader.common import DataActor
@@ -24,7 +27,8 @@ from nautilus_trader.model import BarType
 
 
 class MyActorConfig(DataActorConfig):
-    def __init__(self, bar_type: BarType, **_kwargs) -> None:
+    def __init__(self, *, bar_type: BarType, **_kwargs) -> None:
+        super().__init__()
         self.bar_type = bar_type
 
 
@@ -86,15 +90,15 @@ lifecycle handler, the actor reaches the destination state only after that handl
 
 Override these methods to hook into lifecycle events:
 
-| Method         | When called                                                                    |
-| -------------- | ------------------------------------------------------------------------------ |
-| `on_start()`   | Actor is starting; subscribe to data here.                                     |
-| `on_stop()`    | Actor is stopping; clean up actor-owned resources.                             |
-| `on_resume()`  | Actor is resuming after it stopped or degraded.                                |
-| `on_reset()`   | Actor is resetting, including when the engine resets between backtest runs.    |
-| `on_degrade()` | Actor is entering a degraded state and may provide only partial functionality. |
-| `on_fault()`   | Actor is entering the faulted state after it encounters a fault.               |
-| `on_dispose()` | Actor is being disposed and must release its remaining resources.              |
+| Method         | When called                                                                                                            |
+| -------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `on_start()`   | Actor is starting; subscribe to data here.                                                                             |
+| `on_stop()`    | Actor is stopping; clean up actor-owned resources.                                                                     |
+| `on_resume()`  | Actor is resuming after it stopped or degraded.                                                                        |
+| `on_reset()`   | Actor is resetting, including between backtest runs; retained data subscriptions are released after the hook succeeds. |
+| `on_degrade()` | Actor is entering a degraded state and may provide only partial functionality.                                         |
+| `on_fault()`   | Actor is entering the faulted state after it encounters a fault.                                                       |
+| `on_dispose()` | Actor is being disposed and must release its remaining resources.                                                      |
 
 ## Timers and alerts
 
@@ -418,7 +422,8 @@ from nautilus_trader.model import BarType
 
 
 class MyActorConfig(DataActorConfig):
-    def __init__(self, bar_type: BarType, **_kwargs) -> None:
+    def __init__(self, *, bar_type: BarType, **_kwargs) -> None:
+        super().__init__()
         self.bar_type = bar_type
 
 

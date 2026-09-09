@@ -13,7 +13,8 @@ integration, scheduled checks, and publication.
   tool with caching.
 - [`common-setup`](actions/common-setup/action.yml): configures system packages, Rust and Python
   toolchains, caches, and optional disk or swap preparation.
-- [`common-test-data`](actions/common-test-data/action.yml): caches the large test data set.
+- [`common-test-data`](actions/common-test-data/action.yml): downloads, verifies, and caches the
+  large test data set.
 - [`generate-sbom-retry`](actions/generate-sbom-retry/action.yml): retries SPDX SBOM generation
   after transient failures.
 - [`install-capnp`](actions/install-capnp/action.yml): installs the Cap'n Proto compiler across
@@ -40,7 +41,7 @@ integration, scheduled checks, and publication.
 - [`nightly-merge.yml`](workflows/nightly-merge.yml): fast-forwards `nightly` to the latest
   successful `develop` commit.
 - [`nightly-miri.yml`](workflows/nightly-miri.yml): runs Miri against selected crates.
-- [`nightly-tests.yml`](workflows/nightly-tests.yml): runs Python memory leak tests,
+- [`nightly-tests.yml`](workflows/nightly-tests.yml): runs Rust doctests, Python memory leak tests,
   standard-precision Clippy, extended network tests, and Cargo publication checks.
 - [`openssf-scorecard.yml`](workflows/openssf-scorecard.yml): publishes OpenSSF Scorecard results
   and uploads SARIF.

@@ -21,7 +21,7 @@ use std::{
 use ahash::AHashSet;
 use indexmap::IndexMap;
 use log::{Level, LevelFilter, Log, Metadata, Record};
-use nautilus_core::UnixNanos;
+use nautilus_core::{DurationNanos, UnixNanos, correctness::CorrectnessError};
 use parking_lot::{Mutex, MutexGuard};
 use rstest::{fixture, rstest};
 use rust_decimal::Decimal;
@@ -7071,7 +7071,7 @@ fn test_own_book_client_order_ids_preserved_across_remove() {
 fn test_own_book_client_order_ids_after_update_with_price_change() {
     // Documents the order semantics of OwnBookLadder::update when the
     // price changes: shift_remove + add re-appends the order at the end
-    // of the cache. Locks in this behaviour so a future swap to
+    // of the cache. Locks in this behavior so a future swap to
     // swap_remove or a different update path would surface in tests.
     let instrument_id = InstrumentId::from("AAPL.XNAS");
     let mut own_book = OwnOrderBook::new(instrument_id);
@@ -7636,7 +7636,7 @@ fn own_order_passes_filter(
         && ts_now.is_none_or(|ts_now| {
             order
                 .ts_accepted
-                .checked_add(accepted_buffer_ns)
+                .checked_add(DurationNanos::new(accepted_buffer_ns))
                 .is_some_and(|eligible_at| eligible_at.as_u64() <= ts_now)
         })
 }
@@ -9954,6 +9954,32 @@ fn test_book_get_levels_for_price_panics_on_raw_size_overflow() {
     book.add(ask2, 0, 2, 2.into());
 
     let _ = book.get_all_crossed_levels(OrderSide::Buy, price, FIXED_PRECISION);
+}
+
+#[rstest]
+fn test_book_get_levels_for_price_checked_returns_error_on_aggregate_overflow() {
+    let instrument_id = InstrumentId::from("ETHUSDT-PERP.BINANCE");
+    let mut book = OrderBook::new(instrument_id, BookType::L3_MBO);
+    let price = Price::from("1.001");
+    let size = Quantity::from_raw(QUANTITY_RAW_MAX, FIXED_PRECISION);
+    let ask1 = BookOrder::new(OrderSide::Sell, price, size, 1);
+    let ask2 = BookOrder::new(OrderSide::Sell, price, size, 2);
+    book.add(ask1, 0, 1, 1.into());
+    book.add(ask2, 0, 2, 2.into());
+
+    let error = book
+        .get_all_crossed_levels_checked(OrderSide::Buy, price, FIXED_PRECISION)
+        .unwrap_err();
+
+    #[cfg(not(feature = "high-precision"))]
+    let message = "Overflow occurred when summing `BookLevel` raw size".to_string();
+    #[cfg(feature = "high-precision")]
+    let message = format!(
+        "raw value {} exceeds QUANTITY_RAW_MAX={QUANTITY_RAW_MAX}",
+        QUANTITY_RAW_MAX * 2
+    );
+
+    assert_eq!(error, CorrectnessError::PredicateViolation { message });
 }
 
 #[rstest]

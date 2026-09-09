@@ -250,7 +250,7 @@ impl PyDataActorInner {
     fn execute_exec_algorithm_command(&mut self, command: &TradingCommand) -> anyhow::Result<()> {
         if self.core.config.log_commands {
             let id = self.core.actor_id;
-            log::info!("{id} {RECV}{CMD} {command:?}");
+            log::info!("{id} {RECV}{CMD} {command}");
         }
 
         if self.core.state() != ComponentState::Running {
@@ -269,7 +269,7 @@ impl PyDataActorInner {
                     .map_err(|e| anyhow::anyhow!("Python on_order_list failed: {e}"))
             }
             _ => {
-                log::warn!("Unhandled command type: {command:?}");
+                log::warn!("Unhandled command type: {command}");
                 Ok(())
             }
         }
@@ -3334,9 +3334,9 @@ class PreparedActor(DataActor):
 
         let received = received.borrow();
         assert_eq!(received.len(), 2);
-        assert_eq!(received[0].name.as_str(), "example");
+        assert_eq!(received[0].name, "example");
         assert_eq!(received[0].value, "1.0");
-        assert_eq!(received[1].name.as_str(), "risk");
+        assert_eq!(received[1].name, "risk");
         assert_eq!(received[1].value, "HIGH");
         assert_eq!(
             received[1].ts_event,
@@ -3946,7 +3946,7 @@ class CapturingActor:
 
         assert_eq!(command.trader_id, trader_id);
         assert_eq!(command.client_id, ClientId::from("POLYMARKET"));
-        assert_eq!(command.endpoint.as_str(), "polymarket-market-streams");
+        assert_eq!(command.endpoint, "polymarket-market-streams");
         assert_eq!(command.ts_init, UnixNanos::default());
     }
 

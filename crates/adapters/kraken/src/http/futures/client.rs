@@ -391,13 +391,9 @@ impl KrakenFuturesRawHttpClient {
         let cancellation_token = self.cancellation_token();
 
         self.retry_manager
-            .execute_with_retry_with_cancel(
-                &endpoint,
-                operation,
-                should_retry,
-                create_error,
-                &cancellation_token,
-            )
+            .invocation(&endpoint, operation, should_retry, create_error)
+            .cancellation_token(&cancellation_token)
+            .execute()
             .await
     }
 
@@ -1263,27 +1259,25 @@ impl KrakenFuturesHttpClient {
         self.clock.get_time_ns()
     }
 
-    /// Requests tradable instruments from Kraken Futures.
+    /// Requests the complete tradable instrument catalog from Kraken Futures.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying request fails or any instrument definition cannot be
+    /// parsed. An instrument parse failure returns [`KrakenHttpError::ParseError`] without a
+    /// partial catalog.
     pub async fn request_instruments(&self) -> anyhow::Result<Vec<InstrumentAny>, KrakenHttpError> {
         let ts_init = self.generate_ts_init();
         let response = self.inner.get_instruments().await?;
 
-        let instruments: Vec<InstrumentAny> = response
+        response
             .instruments
             .iter()
-            .filter_map(|fut_instrument| {
-                match parse_futures_instrument(fut_instrument, ts_init, ts_init) {
-                    Ok(instrument) => Some(instrument),
-                    Err(e) => {
-                        let symbol = &fut_instrument.symbol;
-                        log::warn!("Failed to parse futures instrument {symbol}: {e}");
-                        None
-                    }
-                }
+            .map(|fut_instrument| {
+                parse_futures_instrument(fut_instrument, ts_init, ts_init)
+                    .map_err(|e| KrakenHttpError::ParseError(e.to_string()))
             })
-            .collect();
-
-        Ok(instruments)
+            .collect()
     }
 
     /// Requests the current market status for Kraken Futures instruments.
@@ -2980,7 +2974,7 @@ mod tests {
         assert_eq!(margins.len(), 1);
         let margin = &margins[0];
         assert!(margin.instrument_id.is_none());
-        assert_eq!(margin.currency.code.as_str(), "USD");
+        assert_eq!(margin.currency.code, "USD");
         assert_eq!(margin.initial.as_decimal(), dec!(500));
         assert_eq!(margin.maintenance.as_decimal(), dec!(250));
     }

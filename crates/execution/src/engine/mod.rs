@@ -48,8 +48,7 @@ use nautilus_common::{
         ExecutionReport,
         execution::{
             BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, ModifyOrder,
-            PARAMS_EMERGENCY_EXIT, QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList,
-            TradingCommand,
+            QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList, TradingCommand,
         },
     },
     msgbus::{
@@ -63,8 +62,8 @@ use nautilus_common::{
     timer::{TimeEvent, TimeEventCallback},
 };
 use nautilus_core::{
-    UUID4, UnixNanos, WeakCell,
-    datetime::{checked_mins_to_nanos, mins_to_secs, secs_to_nanos},
+    DurationNanos, UUID4, UnixNanos, WeakCell,
+    datetime::{mins_to_secs, secs_to_nanos},
 };
 use nautilus_model::{
     accounts::Account,
@@ -118,7 +117,6 @@ pub struct ExecutionEngine {
     default_client_id: Option<ClientId>,
     routing_map: HashMap<Venue, ClientId>,
     oms_overrides: HashMap<StrategyId, OmsType>,
-    external_order_claims: HashMap<InstrumentId, StrategyId>,
     external_clients: HashSet<ClientId>,
     pos_id_generator: PositionIdGenerator,
     config: ExecutionEngineConfig,
@@ -152,7 +150,6 @@ impl ExecutionEngine {
             default_client_id: None,
             routing_map: HashMap::new(),
             oms_overrides: HashMap::new(),
-            external_order_claims: HashMap::new(),
             external_clients: config
                 .as_ref()
                 .and_then(|c| c.external_clients.clone())
@@ -331,7 +328,11 @@ impl ExecutionEngine {
     #[must_use]
     /// Returns the set of instruments that have external order claims.
     pub fn get_external_order_claims_instruments(&self) -> HashSet<InstrumentId> {
-        self.external_order_claims.keys().copied().collect()
+        self.cache
+            .borrow()
+            .external_order_claim_instrument_ids(None)
+            .into_iter()
+            .collect()
     }
 
     #[must_use]
@@ -343,19 +344,7 @@ impl ExecutionEngine {
     #[must_use]
     /// Returns any external order claim for the given instrument ID.
     pub fn get_external_order_claim(&self, instrument_id: &InstrumentId) -> Option<StrategyId> {
-        self.external_order_claims.get(instrument_id).copied()
-    }
-
-    /// Returns the instruments with external order claims owned by `strategy_id`.
-    #[must_use]
-    pub fn get_external_order_claims_for_strategy(
-        &self,
-        strategy_id: StrategyId,
-    ) -> HashSet<InstrumentId> {
-        self.external_order_claims
-            .iter()
-            .filter_map(|(instrument_id, owner)| (*owner == strategy_id).then_some(*instrument_id))
-            .collect()
+        self.cache.borrow().external_order_claim(instrument_id)
     }
 
     /// Registers a new execution client.
@@ -598,20 +587,10 @@ impl ExecutionEngine {
         strategy_id: StrategyId,
         instrument_ids: &HashSet<InstrumentId>,
     ) -> anyhow::Result<()> {
-        // Validate all instruments first
-        for instrument_id in instrument_ids {
-            if let Some(existing) = self.external_order_claims.get(instrument_id) {
-                anyhow::bail!(
-                    "External order claim for {instrument_id} already exists for {existing}"
-                );
-            }
-        }
-
-        // If validation passed, insert all claims
-        for instrument_id in instrument_ids {
-            self.external_order_claims
-                .insert(*instrument_id, strategy_id);
-        }
+        let instrument_ids: Vec<_> = instrument_ids.iter().copied().collect();
+        self.cache
+            .borrow_mut()
+            .register_external_order_claims(strategy_id, &instrument_ids)?;
 
         if !instrument_ids.is_empty() {
             log::info!("Registered external order claims for {strategy_id}: {instrument_ids:?}");
@@ -620,39 +599,16 @@ impl ExecutionEngine {
         Ok(())
     }
 
-    /// Commits external order claims for `strategy_id` without validation.
-    ///
-    /// The caller must have preflighted every instrument against
-    /// [`Self::get_external_order_claim`]: an existing claim is overwritten
-    /// without error. Coordinated live-node callers should use
-    /// `LiveNode::register_external_order_claims`, which preflights both the
-    /// execution engine and the reconciliation manager before committing;
-    /// ordinary callers should use
-    /// [`Self::register_external_order_claims`] instead.
-    pub fn commit_external_order_claims(
-        &mut self,
-        strategy_id: StrategyId,
-        instrument_ids: &HashSet<InstrumentId>,
-    ) {
-        self.external_order_claims.extend(
-            instrument_ids
-                .iter()
-                .map(|instrument_id| (*instrument_id, strategy_id)),
-        );
-
-        if !instrument_ids.is_empty() {
-            log::info!("Registered external order claims for {strategy_id}: {instrument_ids:?}");
-        }
-    }
-
     /// Deregisters all external order claims owned by `strategy_id`.
     ///
-    /// Coordinated live-node callers should use
-    /// `LiveNode::deregister_external_order_claims` so the execution engine and
-    /// reconciliation manager remain consistent.
+    /// # Panics
+    ///
+    /// Panics if the shared cache is already borrowed.
     pub fn deregister_external_order_claims(&mut self, strategy_id: StrategyId) {
-        self.external_order_claims
-            .retain(|_, owner| *owner != strategy_id);
+        self.cache
+            .borrow_mut()
+            .set_external_order_claims(strategy_id, &[])
+            .expect("clearing external order claims cannot fail");
     }
 
     /// # Errors
@@ -759,7 +715,7 @@ impl ExecutionEngine {
                 .borrow_mut()
                 .set_timer_ns(
                     TIMER_SNAPSHOT_POSITIONS,
-                    interval_ns,
+                    DurationNanos::new(interval_ns),
                     None,
                     None,
                     Some(callback),
@@ -799,7 +755,7 @@ impl ExecutionEngine {
                 .contains(&TIMER_PURGE_CLOSED_ORDERS)
         {
             'purge_closed_orders: {
-                let Some(interval_ns) = checked_mins_to_nanos(u64::from(interval_mins)) else {
+                let Ok(interval_ns) = DurationNanos::try_from_mins(u64::from(interval_mins)) else {
                     log::error!(
                         "Invalid purge_closed_orders_interval_mins {interval_mins}: minutes to nanoseconds conversion overflow"
                     );
@@ -845,7 +801,7 @@ impl ExecutionEngine {
                 .contains(&TIMER_PURGE_CLOSED_POSITIONS)
         {
             'purge_closed_positions: {
-                let Some(interval_ns) = checked_mins_to_nanos(u64::from(interval_mins)) else {
+                let Ok(interval_ns) = DurationNanos::try_from_mins(u64::from(interval_mins)) else {
                     log::error!(
                         "Invalid purge_closed_positions_interval_mins {interval_mins}: minutes to nanoseconds conversion overflow"
                     );
@@ -893,7 +849,7 @@ impl ExecutionEngine {
                 .contains(&TIMER_PURGE_ACCOUNT_EVENTS)
         {
             'purge_account_events: {
-                let Some(interval_ns) = checked_mins_to_nanos(u64::from(interval_mins)) else {
+                let Ok(interval_ns) = DurationNanos::try_from_mins(u64::from(interval_mins)) else {
                     log::error!(
                         "Invalid purge_account_events_interval_mins {interval_mins}: minutes to nanoseconds conversion overflow"
                     );
@@ -1352,9 +1308,9 @@ impl ExecutionEngine {
     }
 
     fn resolve_external_strategy(&self, instrument_id: &InstrumentId) -> StrategyId {
-        self.external_order_claims
-            .get(instrument_id)
-            .copied()
+        self.cache
+            .borrow()
+            .external_order_claim(instrument_id)
             .unwrap_or_else(StrategyId::external)
     }
 
@@ -1366,7 +1322,7 @@ impl ExecutionEngine {
     /// Returns the registered order on success.
     #[allow(
         clippy::too_many_arguments,
-        reason = "external order materialisation threads several ids and a timestamp"
+        reason = "external order materialization threads several ids and a timestamp"
     )]
     fn materialize_external_order(
         &self,
@@ -1528,7 +1484,7 @@ impl ExecutionEngine {
     ///
     /// Real fills supplied by the adapter are applied first so their `trade_id` and
     /// `commission` are preserved; any residual quantity not covered by the fills is
-    /// then synthesised as an inferred fill from the status report's `avg_px`.
+    /// then synthesized as an inferred fill from the status report's `avg_px`.
     /// Adapters use this to emit ADL / liquidation / settlement events without
     /// losing real fill metadata.
     pub fn reconcile_order_with_fills(&mut self, report: &OrderStatusReport, fills: &[FillReport]) {
@@ -1688,6 +1644,10 @@ impl ExecutionEngine {
         );
 
         let Some(position) = cache.position(venue_position_id) else {
+            if report.signed_decimal_qty == Decimal::ZERO {
+                return;
+            }
+
             log::error!("Cannot reconcile position: {venue_position_id} not found in cache");
             return;
         };
@@ -1925,7 +1885,6 @@ impl ExecutionEngine {
         self.event_count = 0;
         self.report_count = 0;
         self.filtered_unclaimed_external_order_count = 0;
-
         log::info!("Reset");
     }
 
@@ -1950,21 +1909,34 @@ impl ExecutionEngine {
         self.command_count.set(self.command_count.get() + 1);
 
         if self.config.debug {
-            log::debug!("{RECV}{CMD} {command:?}");
+            log::debug!("{RECV}{CMD} {command}");
+        }
+
+        match self.validate_submission(&command) {
+            SubmissionValidationResult::Valid => {}
+            SubmissionValidationResult::StaleOrder {
+                client_order_id,
+                status,
+            } => {
+                log::warn!(
+                    "Skipping stale submit command for {client_order_id} in status {status}"
+                );
+                return;
+            }
+            SubmissionValidationResult::Deny(reason) => {
+                self.deny_submission(&command, &reason);
+                return;
+            }
         }
 
         if let Some(cid) = command.client_id()
             && self.external_clients.contains(&cid)
         {
-            if self.deny_external_emergency_exit(&command, cid) {
-                return;
-            }
-
             let topic = format!("commands.trading.{cid}");
             msgbus::publish_any(topic.into(), &command);
 
             if self.config.debug {
-                log::debug!("Skipping execution command for external client {cid}: {command:?}");
+                log::debug!("Skipping execution command for external client {cid}: {command}");
             }
             return;
         }
@@ -1975,7 +1947,7 @@ impl ExecutionEngine {
             let routing_context = Self::routing_context_for_command(&command);
 
             log::error!(
-                "No execution client found for command: client_id={:?}, {routing_context}, command={command:?}",
+                "No execution client found for command: client_id={:?}, {routing_context}, command={command}",
                 command.client_id(),
             );
 
@@ -2026,44 +1998,109 @@ impl ExecutionEngine {
         }
     }
 
-    fn deny_external_emergency_exit(&self, command: &TradingCommand, client_id: ClientId) -> bool {
-        let TradingCommand::SubmitOrder(cmd) = command else {
-            return false;
-        };
-        let is_verified_emergency_exit = cmd
-            .params
-            .as_ref()
-            .and_then(|params| params.get_bool(PARAMS_EMERGENCY_EXIT))
-            .unwrap_or(false);
+    fn validate_submission(&self, command: &TradingCommand) -> SubmissionValidationResult {
+        match command {
+            TradingCommand::SubmitOrder(cmd) => {
+                let cache = self.cache.borrow();
+                let Some(order) = cache.order(&cmd.client_order_id) else {
+                    return SubmissionValidationResult::Valid;
+                };
 
-        if !is_verified_emergency_exit {
-            return false;
+                if matches!(
+                    order.status(),
+                    OrderStatus::Initialized | OrderStatus::Released
+                ) {
+                    SubmissionValidationResult::Valid
+                } else {
+                    SubmissionValidationResult::StaleOrder {
+                        client_order_id: order.client_order_id(),
+                        status: order.status(),
+                    }
+                }
+            }
+            TradingCommand::SubmitOrderList(cmd) => {
+                let cache = self.cache.borrow();
+                let has_ineligible_order = cmd
+                    .order_list
+                    .client_order_ids
+                    .iter()
+                    .filter_map(|client_order_id| cache.order(client_order_id))
+                    .any(|order| {
+                        !matches!(
+                            order.status(),
+                            OrderStatus::Initialized | OrderStatus::Released
+                        )
+                    });
+
+                if !has_ineligible_order {
+                    return SubmissionValidationResult::Valid;
+                }
+
+                SubmissionValidationResult::Deny(OrderDeniedReason::OrderListDenied {
+                    order_list_id: cmd.order_list.id,
+                })
+            }
+            _ => SubmissionValidationResult::Valid,
+        }
+    }
+
+    fn deny_submission(&self, command: &TradingCommand, reason: &OrderDeniedReason) {
+        let TradingCommand::SubmitOrderList(cmd) = command else {
+            return;
+        };
+
+        let cache = self.cache.borrow();
+        let mut orders: Vec<OrderAny> = cmd
+            .order_list
+            .client_order_ids
+            .iter()
+            .filter_map(|client_order_id| cache.order_owned(client_order_id))
+            .collect();
+        drop(cache);
+
+        for client_order_id in &cmd.order_list.client_order_ids {
+            if orders
+                .iter()
+                .any(|order| order.client_order_id() == *client_order_id)
+            {
+                continue;
+            }
+
+            let Some(order_init) = cmd
+                .order_inits
+                .iter()
+                .find(|init| init.client_order_id == *client_order_id)
+            else {
+                continue;
+            };
+
+            if let Some(order) = self.add_order_from_init(order_init, cmd.position_id, cmd) {
+                orders.push(order);
+            }
         }
 
-        let cached_order = {
-            self.cache
-                .borrow()
-                .order(&cmd.client_order_id)
-                .map(|o| o.clone())
-        };
-        let order = cached_order
-            .or_else(|| self.add_order_from_init(&cmd.order_init, cmd.position_id, cmd));
-        let Some(order) = order else {
-            log::error!(
-                "Cannot deny external emergency exit: client_order_id={}, external_client_id={client_id}, suppressed_command={cmd}",
-                cmd.client_order_id,
+        let mut eligible_orders = orders
+            .iter()
+            .filter(|order| {
+                matches!(
+                    order.status(),
+                    OrderStatus::Initialized | OrderStatus::Released
+                )
+            })
+            .peekable();
+
+        if eligible_orders.peek().is_none() {
+            log::warn!(
+                "Skipping stale submit command for order list {}",
+                cmd.order_list.id
             );
-            return true;
-        };
-
-        let reason = OrderDeniedReason::ReduceOnlyEnforcementNotEstablished {
-            client_id,
-            instrument_id: order.instrument_id(),
+            return;
         }
-        .to_string();
-        self.deny_order(&order, &reason);
 
-        true
+        let reason = reason.to_string();
+        for order in eligible_orders {
+            self.deny_order(order, &reason);
+        }
     }
 
     fn routing_context_for_command(command: &TradingCommand) -> String {
@@ -2183,23 +2220,6 @@ impl ExecutionEngine {
                 client_id,
                 order_venue,
                 client_venue,
-            }
-            .to_string();
-            self.deny_order(&order, &reason);
-            return;
-        }
-
-        let is_verified_emergency_exit = cmd
-            .params
-            .as_ref()
-            .and_then(|params| params.get_bool(PARAMS_EMERGENCY_EXIT))
-            .unwrap_or(false);
-        // This marker records risk-engine provenance in the supported pipeline; it is not an
-        // authentication boundary for components that publish directly to execution.
-        if is_verified_emergency_exit && !client.enforces_reduce_only(&cmd, &order) {
-            let reason = OrderDeniedReason::ReduceOnlyNotEnforced {
-                client_id: client.client_id(),
-                instrument_id: order.instrument_id(),
             }
             .to_string();
             self.deny_order(&order, &reason);
@@ -2755,7 +2775,7 @@ impl ExecutionEngine {
         self.event_count += 1;
 
         if self.config.debug {
-            log::debug!("{RECV}{EVT} {event:?}");
+            log::debug!("{RECV}{EVT} {event}");
         }
 
         let event_client_order_id = event.client_order_id();
@@ -3226,20 +3246,22 @@ impl ExecutionEngine {
             && cached_position_id != fill_position_id
         {
             if oms_type == OmsType::Hedging {
-                log::error!(
-                    "Cannot apply hedging fill {} for {}: venue position ID {fill_position_id} conflicts with cached position ID {cached_position_id}",
-                    fill.trade_id,
-                    fill.client_order_id(),
+                if !self.is_flip_remainder(fill, cached_position_id, fill_position_id) {
+                    log::error!(
+                        "Cannot apply hedging fill {} for {}: venue position ID {fill_position_id} conflicts with cached position ID {cached_position_id}",
+                        fill.trade_id,
+                        fill.client_order_id(),
+                    );
+
+                    return None;
+                }
+            } else {
+                log::warn!(
+                    "Incorrect position ID assigned to fill: \
+                     cached={cached_position_id}, assigned={fill_position_id}; \
+                     re-assigning from cache",
                 );
-
-                return None;
             }
-
-            log::warn!(
-                "Incorrect position ID assigned to fill: \
-                 cached={cached_position_id}, assigned={fill_position_id}; \
-                 re-assigning from cache",
-            );
         }
 
         if let Some(position_id) = cached_position_id {
@@ -3341,6 +3363,43 @@ impl ExecutionEngine {
         }
 
         true
+    }
+
+    /// Returns whether `fill` is a later fill of an order this engine already flipped.
+    ///
+    /// Flipping under `Hedging` closes the original virtual position with the reversing order
+    /// and opens a newly minted virtual position from the same order, moving the order's cache
+    /// index onto the new ID. Every later fill of that order still carries the original ID, so
+    /// the venue ID and the cached ID disagree for the rest of the order's life.
+    ///
+    /// The split is recognized from the two positions rather than from the order, because
+    /// applying a fill writes the determined ID onto the order and would erase the evidence for
+    /// the fill after it. Both halves must still name this order: the cached position was opened
+    /// by it, and the position the fill names was closed by it.
+    fn is_flip_remainder(
+        &self,
+        fill: &OrderFilled,
+        cached_position_id: PositionId,
+        fill_position_id: PositionId,
+    ) -> bool {
+        if !cached_position_id.is_virtual() || !fill_position_id.is_virtual() {
+            return false;
+        }
+
+        let cache = self.cache.borrow();
+        let client_order_id = fill.client_order_id();
+
+        let opened_by_order = cache
+            .position_ref(&cached_position_id)
+            .is_some_and(|flipped| flipped.opening_order_id == client_order_id);
+
+        let closed_by_order = cache
+            .position_ref(&fill_position_id)
+            .is_some_and(|original| {
+                original.is_closed() && original.closing_order_id == Some(client_order_id)
+            });
+
+        opened_by_order && closed_by_order
     }
 
     fn determine_hedging_position_id(
@@ -4222,15 +4281,18 @@ impl ExecutionEngine {
                     position.id
                 );
             }
-            // Snapshot closed position if reopening (NETTING mode)
-            self.snapshot_position(position)?;
         } else {
             // HEDGING mode
             log::warn!(
-                "Received fill for closed position {} in HEDGING mode; creating new position and ignoring previous state",
+                "Received fill for closed position {} in HEDGING mode; archiving closed cycle and creating new position",
                 position.id
             );
         }
+
+        // Snapshot the closed cycle before its ID is reused: `add_position` replaces the
+        // cached position, and realized PnL totals read closed cycles from the snapshots
+        self.snapshot_position(position)?;
+
         Ok(())
     }
 
@@ -4402,8 +4464,8 @@ impl ExecutionEngine {
             && let Some(position_id) = fill.position_id
             && position_id.is_virtual()
         {
-            log::warn!("Closing position {fill_split1:?}");
-            log::warn!("Flipping position {fill_split2:?}");
+            log::warn!("Closing position {fill_split1}");
+            log::warn!("Flipping position {fill_split2}");
         }
 
         // Open flipped position
@@ -4473,6 +4535,15 @@ impl ExecutionEngine {
 
         RefMut::map(cache, |c| c.own_order_book_mut(instrument_id).unwrap())
     }
+}
+
+enum SubmissionValidationResult {
+    Valid,
+    StaleOrder {
+        client_order_id: ClientOrderId,
+        status: OrderStatus,
+    },
+    Deny(OrderDeniedReason),
 }
 
 #[cfg(test)]

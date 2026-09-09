@@ -126,30 +126,36 @@ impl KrakenFuturesExecutionClient {
         let session_tasks = TaskGroup::new();
         let cancellation_token = session_tasks.cancellation_token();
         let pending_tasks = TaskGroup::new();
+        let api_key = config.api_key.expose_secret().to_owned();
+        let api_secret = config.api_secret.expose_secret().to_owned();
+        let proxy_url = config
+            .proxy_url
+            .as_ref()
+            .map(|value| value.expose_secret().to_owned());
 
         let http = KrakenFuturesHttpClient::with_credentials(
-            config.api_key.clone(),
-            config.api_secret.clone(),
+            api_key.clone(),
+            api_secret.clone(),
             config.environment,
             config.base_url.clone(),
             config.timeout_secs,
+            Some(config.max_retries),
             None,
             None,
-            None,
-            config.proxy_url.clone(),
+            proxy_url.clone(),
             config
                 .max_requests_per_second
                 .unwrap_or(KRAKEN_FUTURES_DEFAULT_RATE_LIMIT_PER_SECOND),
         )?;
 
-        let credential = KrakenCredential::new(config.api_key.clone(), config.api_secret.clone());
+        let credential = KrakenCredential::new(api_key, api_secret);
         let ws = KrakenFuturesWebSocketClient::with_credentials(
             config.ws_url(),
             config.heartbeat_interval_secs,
             Some(credential),
             config.auth_timeout_secs,
             config.transport_backend,
-            config.proxy_url.clone(),
+            proxy_url,
         )
         .with_socket_control(SocketControl::new(
             core.client_id,
@@ -887,7 +893,7 @@ impl ExecutionClient for KrakenFuturesExecutionClient {
     }
 
     fn query_account(&self, cmd: QueryAccount) -> anyhow::Result<()> {
-        log::debug!("Querying account: {cmd:?}");
+        log::debug!("Querying account: {cmd}");
 
         let account_id = self.core.account_id;
         let http = self.http.clone();
@@ -909,7 +915,7 @@ impl ExecutionClient for KrakenFuturesExecutionClient {
     }
 
     fn query_order(&self, cmd: QueryOrder) -> anyhow::Result<()> {
-        log::debug!("Querying order: {cmd:?}");
+        log::debug!("Querying order: {cmd}");
 
         let venue_order_id = cmd
             .venue_order_id

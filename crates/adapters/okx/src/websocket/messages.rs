@@ -13,9 +13,12 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Data structures modelling OKX WebSocket request and response payloads.
+//! Data structures modeling OKX WebSocket request and response payloads.
 
 use derive_builder::Builder;
+#[cfg(test)]
+use nautilus_core::string::secret::REDACTED;
+use nautilus_core::string::secret::SecretString;
 use nautilus_model::{
     data::{Data, FundingRateUpdate, InstrumentStatus, OrderBookDeltas},
     events::{
@@ -28,6 +31,7 @@ use nautilus_model::{
 };
 use serde::{Deserialize, Serialize};
 use ustr::Ustr;
+use zeroize::Zeroize;
 
 use super::enums::{OKXWsChannel, OKXWsOperation};
 use crate::{
@@ -182,20 +186,21 @@ pub struct OKXWsRequest<T> {
 }
 
 /// OKX WebSocket authentication message.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Zeroize)]
 pub struct OKXAuthentication {
+    #[zeroize(skip)]
     pub op: &'static str,
     pub args: Vec<OKXAuthenticationArg>,
 }
 
 /// OKX WebSocket authentication arguments.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Zeroize)]
 #[serde(rename_all = "camelCase")]
 pub struct OKXAuthenticationArg {
-    pub api_key: String,
-    pub passphrase: String,
+    pub api_key: SecretString,
+    pub passphrase: SecretString,
     pub timestamp: String,
-    pub sign: String,
+    pub sign: SecretString,
 }
 
 #[derive(Debug, Serialize)]
@@ -1350,10 +1355,6 @@ pub struct WsPostOrderParams {
     #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attach_algo_ords: Option<Vec<WsAttachAlgoOrdParams>>,
-    /// Event contract speed bump flag. Use "1" for non-post-only EVENTS orders.
-    #[builder(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub speed_bump: Option<String>,
     /// Event contract market outcome: yes or no.
     #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1439,9 +1440,6 @@ pub struct WsAmendOrderParams {
     /// Whether OKX may round the amended price to an eligible RPI price.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rpi_px_round: Option<bool>,
-    /// Event contract speed bump flag. Use "1" for non-post-only EVENTS orders.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub speed_bump: Option<String>,
 }
 
 /// Parameters for WebSocket algo order placement.
@@ -1522,6 +1520,31 @@ mod tests {
     use rust_decimal::Decimal;
 
     use super::*;
+
+    #[rstest]
+    fn authentication_preserves_wire_values_and_redacts_debug() {
+        let authentication = OKXAuthentication {
+            op: "login",
+            args: vec![OKXAuthenticationArg {
+                api_key: SecretString::from("api-key-value"),
+                passphrase: SecretString::from("passphrase-value"),
+                timestamp: "1700000000".to_string(),
+                sign: SecretString::from("signature-value"),
+            }],
+        };
+
+        let json = serde_json::to_value(&authentication).unwrap();
+        let formatted = format!("{authentication:?}");
+
+        assert_eq!(json["op"], "login");
+        assert_eq!(json["args"][0]["apiKey"], "api-key-value");
+        assert_eq!(json["args"][0]["passphrase"], "passphrase-value");
+        assert_eq!(json["args"][0]["sign"], "signature-value");
+        assert!(formatted.contains(REDACTED));
+        assert!(!formatted.contains("api-key-value"));
+        assert!(!formatted.contains("passphrase-value"));
+        assert!(!formatted.contains("signature-value"));
+    }
     use crate::common::testing::load_test_json;
 
     #[rstest]
@@ -2520,32 +2543,37 @@ mod tests {
             .ord_type(OKXOrderType::Limit)
             .sz("10".to_string())
             .px("0.42".to_string())
-            .speed_bump("1")
             .outcome("yes")
             .build()
             .unwrap();
 
         let json: serde_json::Value = serde_json::to_value(&params).unwrap();
 
-        assert_eq!(json["speedBump"], "1");
+        assert!(json.get("speedBump").is_none());
         assert_eq!(json["outcome"], "yes");
     }
 
     #[rstest]
-    fn test_ws_amend_order_params_serializes_speed_bump() {
+    fn test_ws_amend_order_params_omits_speed_bump() {
         use super::WsAmendOrderParamsBuilder;
 
         let params = WsAmendOrderParamsBuilder::default()
             .inst_id_code(10459u64)
             .cl_ord_id("event-1".to_string())
             .new_px("0.43".to_string())
-            .speed_bump("1")
             .build()
             .unwrap();
 
         let json: serde_json::Value = serde_json::to_value(&params).unwrap();
 
-        assert_eq!(json["speedBump"], "1");
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "instIdCode": 10459,
+                "clOrdId": "event-1",
+                "newPx": "0.43",
+            })
+        );
     }
 
     #[rstest]

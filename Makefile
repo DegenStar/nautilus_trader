@@ -49,8 +49,6 @@ endif
 # UV_SYNC_FLAGS controls whether uv keeps packages not managed by this project
 # Set UV_SYNC_FLAGS= to make uv prune packages not in python/uv.lock
 UV_SYNC_FLAGS ?= --inexact
-UV_PROJECT_ENVIRONMENT ?= $(CURDIR)/.venv
-export UV_PROJECT_ENVIRONMENT
 
 # TARGET_DIR controls where Cargo places build artifacts
 TARGET_DIR ?= $(CURDIR)/target
@@ -179,9 +177,15 @@ endif
 # Can be disabled: make cargo-test-core DEFI=false
 DEFI ?= true
 ifeq ($(DEFI),true)
-BASE_FEATURES := arrow,ffi,python,high-precision,streaming,defi
+BASE_FEATURES := $(shell bash scripts/cargo-features.bash)
 else
-BASE_FEATURES := arrow,ffi,python,high-precision,streaming
+BASE_FEATURES := $(shell bash scripts/cargo-features.bash --no-defi)
+endif
+
+# $(shell) swallows a failing or missing script, and an empty list silently
+# compiles every Rust gate with no features rather than failing.
+ifeq ($(strip $(BASE_FEATURES)),)
+$(error scripts/cargo-features.bash produced no features)
 endif
 
 # Combine base features with extra features
@@ -204,6 +208,7 @@ CORE_SELECTED_FEATURES := $(subst $(space),$(comma),$(strip $(CORE_SELECTED_FEAT
 STANDARD_PRECISION_ARGS := --workspace --exclude nautilus-blockchain --no-default-features --lib --tests --features "ffi,python"
 SIM_PACKAGES := -p nautilus-common -p nautilus-core -p nautilus-event-store \
 	-p nautilus-network -p nautilus-execution -p nautilus-live
+SIM_ADAPTER_PACKAGES := -p nautilus-okx
 SIM_FILTERSET := package(nautilus-common) + package(nautilus-event-store) + \
 	package(nautilus-network) + \
 	package(nautilus-execution) + \
@@ -414,7 +419,7 @@ distclean: clean  #-- Nuclear clean - remove all untracked files (requires FORCE
 		exit 1; \
 	fi
 	@echo "WARNING: removing all untracked files (git clean -fxd)..."
-	git clean -fxd -e test_data/large/ -e test_data/local/ -e .venv/
+	git clean -fxd -e test_data/large/ -e test_data/local/ -e python/.venv/
 
 #== Code Quality
 
@@ -446,6 +451,7 @@ check-code-standard-precision:  #-- Run clippy on lib/test targets with standard
 check-code-sim:  #-- Run clippy on DST simulation lib/test targets
 	$(info $(M) Running DST simulation code quality checks...)
 	@cargo clippy $(SIM_CARGO_CONFIG) $(SIM_PACKAGES) --lib --tests --features simulation --profile nextest -- -D warnings
+	@cargo clippy $(SIM_CARGO_CONFIG) $(SIM_ADAPTER_PACKAGES) --lib --tests --no-default-features --features simulation --profile nextest -- -D warnings
 	@printf "$(GREEN)DST simulation checks passed$(RESET)\n"
 
 .PHONY: check-all-targets
@@ -478,13 +484,18 @@ pre-flight:  #-- Run pre-flight checks (format, tests, build, generated drift, a
 		printf "$(YELLOW)Stage your changes first:$(RESET) git add .\n"; \
 		exit 1; \
 	fi
+	@bash scripts/strip-adapter-env.bash $(MAKE) --no-print-directory pre-flight-steps
+
+# Adapter environment variables are stripped so tests cannot depend on locally
+# configured venue credentials (see scripts/strip-adapter-env.bash).
+.PHONY: pre-flight-steps
+pre-flight-steps:
 	@$(timer_start) \
 		$(MAKE) --no-print-directory sync \
 		&& $(MAKE) --no-print-directory format \
 		&& $(MAKE) --no-print-directory test-scripts-quiet \
 		&& $(MAKE) --no-print-directory check-code EXTRA_FEATURES="capnp,hypersync" \
 		&& $(MAKE) --no-print-directory check-code-sim \
-		&& $(MAKE) --no-print-directory cargo-test-doc EXTRA_FEATURES="capnp,hypersync" \
 		&& $(MAKE) --no-print-directory cargo-test-sim \
 		&& $(MAKE) --no-print-directory cargo-test-extras \
 		&& $(MAKE) --no-print-directory cargo-test-postgres-changed \
@@ -492,6 +503,7 @@ pre-flight:  #-- Run pre-flight checks (format, tests, build, generated drift, a
 		&& $(MAKE) --no-print-directory check-generated-drift \
 		&& $(MAKE) --no-print-directory pytest \
 		&& $(MAKE) --no-print-directory pytest-doctest ty \
+		&& $(MAKE) --no-print-directory pytest-isolated \
 		&& $(MAKE) --no-print-directory security-audit \
 	$(call timer_end,Pre-flight)
 
@@ -646,25 +658,36 @@ check-markdown:  #-- Lint Markdown with markdownlint-cli2 and check table delimi
 	@python3 -B scripts/check-markdown-tables.py $(MARKDOWN_FILES)
 	@printf "$(GREEN)Markdown check passed$(RESET)\n"
 
+# Rust doc links are collected into Markdown so lychee parses their `[label](url)` form.
+# A dot-directory keeps the file out of the `**/*.md` glob, which would otherwise read it twice.
+DOC_LINKS = .tmp-doc-links/doc-links.md
+
+LYCHEE_FLAGS = \
+	--verbose \
+	--no-progress \
+	--exclude-all-private \
+	--max-retries 3 \
+	--retry-wait-time 5 \
+	--timeout 30 \
+	--max-concurrency 10 \
+	--accept "100..=103,200..=299,429,502..=504"
+
 .PHONY: docs-check-links
 docs-check-links:  #-- Check for broken links in documentation (periodic audit)
 	$(info $(M) Checking documentation links...)
-	@lychee \
-		--verbose \
-		--no-progress \
-		--exclude-all-private \
-		--max-retries 3 \
-		--retry-wait-time 5 \
-		--timeout 30 \
-		--max-concurrency 10 \
-		--accept "100..=103,200..=299,429,502..=504" \
+	@git ls-files -- '*.rs' ':(exclude)patches/**' \
+		| python3 -B scripts/extract-doc-links.py $(DOC_LINKS)
+	@status=0; \
+	lychee $(LYCHEE_FLAGS) \
 		--include-fragments \
 		--fallback-extensions md,py,html \
 		--exclude-path .venv \
 		--exclude-path target \
 		--exclude-path docs/python-api-latest \
 		--exclude "file://.*/python-api-latest/.*" \
-		"**/*.md" "docs/**/*.py"
+		"**/*.md" "docs/**/*.py" || status=1; \
+	lychee $(LYCHEE_FLAGS) $(DOC_LINKS) || status=1; \
+	exit $$status
 	@printf "$(GREEN)Link check passed$(RESET)\n"
 
 #== Rust Development
@@ -817,10 +840,17 @@ check-jiff-features:  #-- Check jiff features
 	$(info $(M) Checking jiff features...)
 	$Q bash .pre-commit-hooks/check_jiff_features.sh
 
+.PHONY: check-dependency-features
+check-dependency-features:  #-- Check dependency feature policy
+	$(info $(M) Checking dependency features...)
+	$Q python3 -B .pre-commit-hooks/check_dependency_features.py
+
 .PHONY: test-scripts
 test-scripts:  #-- Run repository script tests
 	$(info $(M) Running script tests...)
+	$Q bash .pre-commit-hooks/test_cargo_machete.sh
 	$Q bash .pre-commit-hooks/test_check_cargo_conventions.sh
+	$Q python3 -B .pre-commit-hooks/test_check_dependency_features.py
 	$Q bash .pre-commit-hooks/test_check_docs_conventions.sh
 	$Q bash .pre-commit-hooks/test_check_dst_conventions.sh
 	$Q bash .pre-commit-hooks/test_check_formatting_py.sh
@@ -831,6 +861,9 @@ test-scripts:  #-- Run repository script tests
 	$Q bash .pre-commit-hooks/test_check_unicode_typography.sh
 	$Q bash .pre-commit-hooks/test_check_ustr_conventions.sh
 	$Q bash scripts/ci/test-build-artifact-reuse.bash
+	$Q bash scripts/test-native-path.bash
+	$Q bash scripts/ci/test-wheel-isolation.bash
+	$Q bash scripts/ci/test-python-isolation-setup.bash
 	$Q bash scripts/ci/test-check-docker-toolchain-pins.bash
 	$Q bash scripts/ci/test-check-miri-toolchain.bash
 	$Q bash scripts/ci/test-check-nightly-merge-status.bash
@@ -853,6 +886,8 @@ test-scripts:  #-- Run repository script tests
 	$Q bash scripts/test-clippy-strict-audit.bash
 	$Q bash scripts/test-update-cargo-dependencies.bash
 	$Q python3 -B scripts/ci/test_check_commit_message.py
+	$Q python3 -B scripts/ci/test_check_test_network.py
+	$Q python3 -B scripts/ci/check_test_network.py
 	@printf "$(GREEN)Script tests passed$(RESET)\n"
 
 .PHONY: test-scripts-quiet
@@ -898,7 +933,7 @@ cargo-test-postgres-ci:  #-- Run focused PostgreSQL tests with the CI bootstrap 
 
 POSTGRES_BOOTSTRAP_INPUTS := schema/sql \
 	crates/infrastructure/src/sql/pg.rs \
-	crates/infrastructure/tests/test_cache_database_postgres.rs \
+	crates/infrastructure/tests/integration/test_cache_database_postgres.rs \
 	crates/cli/src/database \
 	crates/cli/src/bin/cli.rs \
 	crates/cli/src/lib.rs \
@@ -914,10 +949,7 @@ cargo-test-postgres-changed:  #-- Run PostgreSQL bootstrap tests when related st
 	fi
 
 # Doctests need their own target because `cargo nextest` cannot run them.
-# Sharing --features and --profile with the nextest targets lets both reuse the
-# same compiled artifacts. Run this before those targets: rustdoc links a
-# throwaway binary per doc example, and going first releases those transient
-# files before the nextest test-binary set lands, which keeps peak disk lower.
+# The scheduled nightly test workflow runs them separately from regular CI.
 .PHONY: cargo-test-doc
 cargo-test-doc: export RUST_BACKTRACE=1
 cargo-test-doc:  #-- Run Rust doctests (examples in `///` and `//!` comments)
@@ -987,8 +1019,7 @@ endif
 # tests are gated out at the source. The lane also runs the LiveNode startup
 # reconciliation timeout regression and the cross-crate seam pinning tests in
 # nautilus-core.
-# Each leg runs with the standard fixed-precision build first, then again
-# under `high-precision` for the crates that consume `nautilus-model` types,
+# Precision-sensitive common and execution tests also run under `high-precision`,
 # so the seam-routed code paths are exercised under both `QuantityRaw` /
 # `PriceRaw` widths (u64 vs u128). See docs/concepts/dst.md for the full
 # DST scope.
@@ -1017,7 +1048,7 @@ cargo-test-core-local-debug:  #-- Run Rust tests for core crates with direct pac
 cargo-test-lib: export RUST_BACKTRACE=1
 cargo-test-lib: check-nextest-installed
 cargo-test-lib:  #-- Run Rust library tests only with high precision
-	cargo nextest run --lib --workspace --no-default-features --features "ffi,python,high-precision,streaming,defi,test-support" $(FAIL_FAST_FLAG) --profile $(NEXTEST_PROFILE) --cargo-profile $(CARGO_CI_PROFILE) $(NEXTEST_OUTPUT_ARGS)
+	cargo nextest run --lib --workspace --no-default-features --features "$(BASE_FEATURES),test-support" $(FAIL_FAST_FLAG) --profile $(NEXTEST_PROFILE) --cargo-profile $(CARGO_CI_PROFILE) $(NEXTEST_OUTPUT_ARGS)
 
 .PHONY: cargo-test-standard-precision
 cargo-test-standard-precision: export RUST_BACKTRACE=1
@@ -1029,7 +1060,7 @@ cargo-test-standard-precision:  #-- Run Rust tests with standard precision (debu
 cargo-test-debug: export RUST_BACKTRACE=1
 cargo-test-debug: check-nextest-installed
 cargo-test-debug:  #-- Run Rust tests with high precision (debug profile)
-	cargo nextest run --workspace --lib --tests --features "ffi,python,high-precision,streaming,defi" $(FAIL_FAST_FLAG) --profile $(NEXTEST_PROFILE) $(NEXTEST_OUTPUT_ARGS)
+	cargo nextest run --workspace --lib --tests --features "$(BASE_FEATURES)" $(FAIL_FAST_FLAG) --profile $(NEXTEST_PROFILE) $(NEXTEST_OUTPUT_ARGS)
 
 .PHONY: cargo-test-coverage
 cargo-test-coverage: check-nextest-installed check-llvm-cov-installed
@@ -1076,7 +1107,7 @@ cargo-test-coverage-crate-html-%:  #-- Run coverage for specific crate with HTML
 # Miri (UB detection)
 # -----------------------------------------------------------------------------
 # Runs library and selected integration tests under Miri to detect undefined
-# behaviour: invalid pointer operations, aliasing violations (Stacked/Tree
+# behavior: invalid pointer operations, aliasing violations (Stacked/Tree
 # Borrows), uninitialised reads, and unsound `unsafe` impls. Requires a nightly
 # toolchain with the `miri` component installed.
 #
@@ -1085,7 +1116,7 @@ cargo-test-coverage-crate-html-%:  #-- Run coverage for specific crate with HTML
 # and `defi` pulls in `alloy-primitives`, which is out of scope here. The
 # `--lib` filter keeps doctests out of the run as well.
 #
-# Proptest cases are dialled down via `PROPTEST_CASES` since Miri is roughly
+# Proptest cases are dialed down via `PROPTEST_CASES` since Miri is roughly
 # 10-100x slower than native execution. `MIRIFLAGS` enables disable-isolation
 # so tests that read environment variables (e.g. PATH probes) work. Most runs
 # use strict provenance; the collections slice uses permissive provenance to
@@ -1307,6 +1338,10 @@ pytest: build-debug  #-- Run Python tests
 	$(info $(M) Running Python tests...)
 	$Q cd python && VIRTUAL_ENV= uv run --no-sync pytest -qq -rfE tests/ --ignore=tests/unit/test_live_node.py
 	$Q cd python && VIRTUAL_ENV= uv run --no-sync pytest -qq -rfE tests/unit/test_live_node.py
+
+.PHONY: pytest-isolated
+pytest-isolated:  #-- Check the existing Python build outside the source checkout
+	$Q bash scripts/test-python-isolation.bash
 
 .PHONY: pytest-doctest
 pytest-doctest: build-debug  #-- Run supported Python doctests

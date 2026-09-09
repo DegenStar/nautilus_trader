@@ -33,12 +33,13 @@ use nautilus_common::{
     },
 };
 use nautilus_core::{
-    AtomicMap, Params, UUID4, UnixNanos,
+    AtomicMap, DurationNanos, Params, UUID4, UnixNanos,
+    string::secret::SecretString,
     time::{AtomicTime, get_atomic_clock_realtime},
 };
 use nautilus_live::{
     ExecutionClientCore, ExecutionEventEmitter, SocketControl,
-    execution::failure::CommandFailure,
+    execution::{failure::CommandFailure, reports::retain_order_status_reports},
     task::{TaskGroup, TaskGroupGuard},
 };
 use nautilus_model::{
@@ -104,15 +105,26 @@ impl AxExecutionClient {
     /// Returns an error if the client fails to initialize.
     pub fn new(core: ExecutionClientCore, config: AxExecutionClientConfig) -> anyhow::Result<Self> {
         let http_client = AxHttpClient::with_credentials(
-            config.api_key.clone().unwrap_or_default(),
-            config.api_secret.clone().unwrap_or_default(),
+            config
+                .api_key
+                .clone()
+                .map(|value| value.into_inner())
+                .unwrap_or_default(),
+            config
+                .api_secret
+                .clone()
+                .map(|value| value.into_inner())
+                .unwrap_or_default(),
             Some(config.http_base_url()),
             Some(config.orders_base_url()),
             config.http_timeout_secs,
             config.max_retries,
             config.retry_delay_initial_ms,
             config.retry_delay_max_ms,
-            config.proxy_url.clone(),
+            config
+                .proxy_url
+                .as_ref()
+                .map(|url| url.expose_secret().to_owned()),
         )?;
 
         let clock = get_atomic_clock_realtime();
@@ -131,7 +143,10 @@ impl AxExecutionClient {
             trader_id,
             config.heartbeat_interval_secs,
             config.transport_backend,
-            config.proxy_url.clone(),
+            config
+                .proxy_url
+                .as_ref()
+                .map(|url| url.expose_secret().to_owned()),
         )
         .with_socket_control(SocketControl::new(
             core.client_id,
@@ -155,7 +170,7 @@ impl AxExecutionClient {
         })
     }
 
-    async fn authenticate(&self, credential: &Credential) -> anyhow::Result<String> {
+    async fn authenticate(&self, credential: &Credential) -> anyhow::Result<SecretString> {
         self.http_client
             .authenticate(
                 credential.api_key(),
@@ -521,9 +536,14 @@ impl ExecutionClient for AxExecutionClient {
         // Reset so requests work after a previous disconnect
         self.http_client.reset_cancellation_token();
 
-        let credential =
-            Credential::resolve(self.config.api_key.clone(), self.config.api_secret.clone())
-                .context("API credentials not configured")?;
+        let credential = Credential::resolve(
+            self.config.api_key.clone().map(|value| value.into_inner()),
+            self.config
+                .api_secret
+                .clone()
+                .map(|value| value.into_inner()),
+        )
+        .context("API credentials not configured")?;
         let token = self.authenticate(&credential).await?;
 
         // Instruments load after authenticating because their fee rates come from the
@@ -551,7 +571,7 @@ impl ExecutionClient for AxExecutionClient {
             self.core.set_instruments_initialized();
         }
 
-        self.ws_orders.connect(&token).await?;
+        self.ws_orders.connect(token.expose_secret()).await?;
         log::debug!("Connected to orders WebSocket");
 
         let stream = self.ws_orders.stream();
@@ -604,7 +624,7 @@ impl ExecutionClient for AxExecutionClient {
             self.session_tasks.spawn(run_auth_token_refresh(
                 self.http_client.clone(),
                 credential,
-                move |token| ws_orders.update_auth_token(&token),
+                move |token| ws_orders.update_auth_token(token.expose_secret()),
             ))?;
             Ok::<(), anyhow::Error>(())
         }
@@ -978,6 +998,7 @@ impl ExecutionClient for AxExecutionClient {
                             false,
                             *venue_order_id,
                             Some(account_id),
+                            None,
                         );
                         emitter.send_order_event(OrderEventAny::Canceled(event));
 
@@ -1071,17 +1092,7 @@ impl ExecutionClient for AxExecutionClient {
             reports.retain(|report| report.instrument_id == instrument_id);
         }
 
-        if cmd.open_only {
-            reports.retain(|r| r.order_status.is_open());
-        }
-
-        if let Some(start) = cmd.start {
-            reports.retain(|r| r.ts_last >= start);
-        }
-
-        if let Some(end) = cmd.end {
-            reports.retain(|r| r.ts_last <= end);
-        }
+        retain_order_status_reports(&mut reports, cmd);
 
         Ok(reports)
     }
@@ -1130,10 +1141,10 @@ impl ExecutionClient for AxExecutionClient {
 
         let ts_now = self.clock.get_time_ns();
 
-        let start = lookback_mins.map(|mins| {
-            let lookback_ns = mins * 60 * 1_000_000_000;
-            UnixNanos::from(ts_now.as_u64().saturating_sub(lookback_ns))
-        });
+        let start = lookback_mins
+            .map(DurationNanos::try_from_mins)
+            .transpose()?
+            .map(|lookback| ts_now.saturating_sub(lookback));
 
         let order_cmd = GenerateOrderStatusReports::new(
             UUID4::new(),
@@ -1703,6 +1714,7 @@ pub(crate) fn create_order_canceled(
         false,
         Some(venue_order_id),
         Some(account_id),
+        None,
     ))
 }
 

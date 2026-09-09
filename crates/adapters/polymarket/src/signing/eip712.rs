@@ -33,6 +33,8 @@ use alloy::{
     sol_types::{SolStruct, SolValue, eip712_domain},
 };
 use alloy_primitives::{Address, B256, FixedBytes, U256, address, keccak256};
+#[cfg(test)]
+use nautilus_core::string::secret::SecretString;
 use rust_decimal::Decimal;
 
 use crate::{
@@ -515,7 +517,7 @@ mod tests {
             timestamp: "1713398400000".to_string(),
             metadata: ZERO_BYTES32.to_string(),
             builder: ZERO_BYTES32.to_string(),
-            signature: String::new(),
+            signature: SecretString::default(),
         }
     }
 
@@ -536,6 +538,20 @@ mod tests {
         // Hardhat account #0
         let expected = Address::from_str("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266").unwrap();
         assert_eq!(signer.address(), expected);
+    }
+
+    #[rstest]
+    fn test_sign_clob_auth_matches_polymarket_mainnet_vector() {
+        let private_key = EvmPrivateKey::new(TEST_PRIVATE_KEY).unwrap();
+
+        let (address, signature) = sign_clob_auth(&private_key, "10000000", 23).unwrap();
+
+        // https://github.com/Polymarket/clob-client/blob/7df8257dc95f99edb257b53a7873e273a9b4a9b3/src/signing/eip712.ts
+        assert_eq!(address, "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266");
+        assert_eq!(
+            signature,
+            "0x1a7118db6100dfd8efd102be36f472b59475dcac56eb4c9a2a94748d3655ba7c3c89deb8c19ee79eceb0a531122fbfbe88ed118034f9d8212e2b725e7b296b9d1c",
+        );
     }
 
     #[rstest]
@@ -835,7 +851,7 @@ mod tests {
             timestamp: timestamp.to_string(),
             metadata: ZERO_BYTES32.to_string(),
             builder: builder.to_string(),
-            signature: String::new(),
+            signature: SecretString::default(),
         }
     }
 

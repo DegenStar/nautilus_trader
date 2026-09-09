@@ -89,7 +89,7 @@ jobs:
         run: bash scripts/ci/verify-ci-inputs.sh post-checkout
 
       - name: Common setup
-        uses: ./.github/actions/common-setup
+        uses: $/.github/actions/common-setup
         with:
           python-version: "3.14"
           free-disk-space: "true"
@@ -160,7 +160,7 @@ jobs:
         run: bash scripts/ci/verify-ci-inputs.sh post-checkout
 
       - name: Common setup
-        uses: ./.github/actions/common-setup
+        uses: $/.github/actions/common-setup
         with:
           python-version: "3.14"
           free-disk-space: "true"
@@ -231,7 +231,7 @@ jobs:
         run: bash scripts/ci/verify-ci-inputs.sh post-checkout
 
       - name: Common setup
-        uses: ./.github/actions/common-setup
+        uses: $/.github/actions/common-setup
         with:
           python-version: "3.14"
           free-disk-space: "true"
@@ -252,21 +252,12 @@ jobs:
           POSTGRES_DATABASE: nautilus
 
       - name: Cached test data
-        uses: ./.github/actions/common-test-data
+        uses: $/.github/actions/common-test-data
 
       - name: Report disk space before Rust tests
         run: bash scripts/ci/report-disk-space.bash "before Rust tests"
 
       # Keep these commands and features aligned with rust-tests-linux-x86 in build.yml
-      - name: Run Rust doctests
-        run: >-
-          make cargo-test-doc
-          EXTRA_FEATURES="capnp,hypersync,nautilus-serialization/sbe,nautilus-infrastructure/postgres"
-
-      - name: Report disk space after Rust doctests
-        if: always()
-        run: bash scripts/ci/report-disk-space.bash "after Rust doctests"
-
       - name: Run Rust tests
         run: >-
           make cargo-test NEXTEST_PROFILE=ci

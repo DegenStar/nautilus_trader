@@ -280,6 +280,7 @@ pub fn parse_order_event(
                     false,
                     Some(venue_order_id),
                     Some(account_id),
+                    None,
                 )))
             }
         }
@@ -398,6 +399,7 @@ pub fn parse_spread_order_event(
                 false,
                 Some(venue_order_id),
                 Some(account_id),
+                None,
             )))
         }
         _ => parse_common_spread_order_status_report(
@@ -629,7 +631,7 @@ pub fn parse_book_msg_vec(
     let mut deltas = Vec::with_capacity(data.len());
 
     for msg in data {
-        deltas.push(Data::Deltas(Box::new(parse_book_msg(
+        deltas.push(Data::BookDeltas(Box::new(parse_book_msg(
             &msg,
             *instrument_id,
             price_precision,
@@ -658,7 +660,7 @@ pub fn parse_rpi_book_msg_vec(
     let mut deltas = Vec::with_capacity(data.len());
 
     for msg in data {
-        deltas.push(Data::Deltas(Box::new(parse_rpi_book_msg(
+        deltas.push(Data::BookDeltas(Box::new(parse_rpi_book_msg(
             &msg,
             *instrument_id,
             price_precision,
@@ -872,7 +874,7 @@ pub fn parse_book10_msg_vec(
             size_precision,
             ts_init,
         )?;
-        depth10_updates.push(Data::Depth10(Box::new(depth10)));
+        depth10_updates.push(Data::BookDepth10(Box::new(depth10)));
     }
 
     Ok(depth10_updates)
@@ -2875,7 +2877,7 @@ mod tests {
 
         assert_eq!(deltas_vec.len(), 1);
 
-        if let Data::Deltas(d) = &deltas_vec[0] {
+        if let Data::BookDeltas(d) = &deltas_vec[0] {
             assert_eq!(d.sequence, 123456);
         } else {
             panic!("Expected Deltas");
@@ -3329,7 +3331,7 @@ mod tests {
 
         assert_eq!(depth10_vec.len(), 1);
 
-        if let Data::Depth10(d) = &depth10_vec[0] {
+        if let Data::BookDepth10(d) = &depth10_vec[0] {
             assert_eq!(d.instrument_id, instrument_id);
             assert_eq!(d.sequence, 123456);
             assert_eq!(d.bids[0].price, Price::from("8476.97"));
@@ -4634,7 +4636,7 @@ mod tests {
         let msg = &data[0];
         assert_eq!(msg.category, OKXOrderCategory::FullLiquidation);
         assert_eq!(msg.state, OKXOrderStatus::Filled);
-        assert_eq!(msg.inst_id.as_str(), "BTC-USDT-SWAP");
+        assert_eq!(msg.inst_id, "BTC-USDT-SWAP");
 
         let account_id = AccountId::new("OKX-001");
         let mut instruments = AHashMap::new();
@@ -4697,7 +4699,7 @@ mod tests {
         let msg = &data[0];
         assert_eq!(msg.category, OKXOrderCategory::Adl);
         assert_eq!(msg.state, OKXOrderStatus::Filled);
-        assert_eq!(msg.inst_id.as_str(), "ETH-USDT-SWAP");
+        assert_eq!(msg.inst_id, "ETH-USDT-SWAP");
 
         let account_id = AccountId::new("OKX-001");
         let mut instruments = AHashMap::new();

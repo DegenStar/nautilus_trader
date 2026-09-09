@@ -37,9 +37,9 @@
 //! - `defi`: Enables the DeFi (Decentralized Finance) domain model.
 //! - `extension-module`: Builds as a Python extension module.
 //! - `ffi`: Enables the C foreign function interface (FFI) from
-//!   [cbindgen](https://github.com/mozilla/cbindgen).
+//!   [cbindgen](https://crates.io/crates/cbindgen).
 //! - `high-precision`: Enables
-//!   [high-precision mode](https://nautilustrader.io/docs/nightly/getting_started/installation#precision-mode)
+//!   [high-precision mode](https://nautilustrader.io/docs/nightly/getting_started/installation/#precision-mode)
 //!   to use 128-bit value types.
 //! - `python`: Enables Python bindings from [PyO3](https://pyo3.rs).
 //! - `python-arrow`: Enables Python bindings together with `PyArrow` `RecordBatch` bridging.
@@ -113,6 +113,11 @@
 // pyo3's `from_py_object` generates `.clone()` on `Copy` fields that clippy flags from the
 // macro expansion; an item-level `allow` cannot reach the expansion
 #![allow(clippy::clone_on_copy)]
+
+// Re-exported so `enum_strum_serde!` can reach serde through `$crate`, which works in a consumer
+// that renames its serde dependency or does not depend on it directly.
+#[doc(hidden)]
+pub use serde as __serde;
 
 pub mod accounts;
 pub mod currencies;

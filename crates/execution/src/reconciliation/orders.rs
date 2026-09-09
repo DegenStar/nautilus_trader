@@ -15,9 +15,8 @@
 
 //! Order and fill reconciliation.
 //!
-//! Event constructors, order state reconciliation, and fill reconciliation. Every
-//! helper turns a venue-sourced report into zero or more `OrderEventAny`s that are
-//! safe to apply to the local order model.
+//! Event construction, order state reconciliation, and fill reconciliation. Venue-sourced
+//! reports become zero or more `OrderEventAny`s that are safe to apply to the local order model.
 
 use nautilus_common::enums::LogColor;
 use nautilus_core::{UUID4, UnixNanos};
@@ -738,6 +737,7 @@ fn create_external_terminal_event(
             true, // reconciliation
             Some(report.venue_order_id),
             Some(account_id),
+            report.cancel_reason.as_deref().map(Ustr::from),
         )),
         OrderStatus::Expired => OrderEventAny::Expired(OrderExpired::new(
             order.trader_id(),
@@ -970,6 +970,7 @@ pub(super) fn create_reconciliation_canceled(
         true, // reconciliation
         order.venue_order_id(),
         order.account_id(),
+        report.cancel_reason.as_deref().map(Ustr::from),
     ))
 }
 
