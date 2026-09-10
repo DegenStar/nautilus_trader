@@ -17,6 +17,7 @@
 
 use std::{collections::HashMap, time::Duration};
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use bytes::Bytes;
 use http::Method;
 use rstest::rstest;
@@ -148,6 +149,142 @@ async fn redirect_method_body_and_credentials_match(
     }
 }
 
+#[rstest]
+#[case::ten_redirects(10, true)]
+#[case::eleven_redirects(11, false)]
+#[tokio::test]
+async fn redirect_limit_preserves_same_origin_credentials(
+    #[case] redirects: usize,
+    #[case] success: bool,
+) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let peer = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        for step in 0..=redirects.min(10) {
+            let headers = read_headers(&mut stream).await;
+            assert!(
+                headers.starts_with(&format!("GET /{step} HTTP/1.1\r\n")),
+                "{headers}"
+            );
+            assert!(
+                headers.contains("authorization: Bearer token-37\r\n"),
+                "{headers}"
+            );
+            assert!(headers.contains("cookie: session=91\r\n"), "{headers}");
+            let response = if step == redirects {
+                "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndone".to_string()
+            } else {
+                format!(
+                    "HTTP/1.1 302 Found\r\nContent-Length: 0\r\nLocation: /{}\r\n\r\n",
+                    step + 1
+                )
+            };
+            stream.write_all(response.as_bytes()).await.unwrap();
+        }
+    });
+    let client = HttpClient::builder()
+        .headers(HashMap::from([
+            ("authorization".into(), "Bearer token-37".into()),
+            ("cookie".into(), "session=91".into()),
+        ]))
+        .use_system_proxy(false)
+        .timeout_secs(3)
+        .build()
+        .unwrap();
+
+    let result = send(&client, Method::GET, format!("http://{addr}/0"), None).await;
+    tokio::time::timeout(Duration::from_secs(3), peer)
+        .await
+        .unwrap()
+        .unwrap();
+
+    if success {
+        let response = result.unwrap();
+        assert_eq!(response.status.as_u16(), 200);
+        assert_eq!(response.headers, HashMap::new());
+        assert_eq!(response.body.as_ref(), b"done");
+    } else {
+        assert!(
+            matches!(result, Err(HttpClientError::Error(ref message)) if message == "too many redirects"),
+            "{result:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn redirect_rejects_unsupported_scheme() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let peer = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_headers(&mut stream).await;
+        stream.write_all(b"HTTP/1.1 302 Found\r\nContent-Length: 0\r\nLocation: ftp://127.0.0.1/file\r\n\r\n").await.unwrap();
+    });
+    let client = HttpClient::builder()
+        .use_system_proxy(false)
+        .timeout_secs(3)
+        .build()
+        .unwrap();
+
+    let result = send(&client, Method::GET, format!("http://{addr}/start"), None).await;
+    peer.await.unwrap();
+
+    assert!(
+        matches!(result, Err(HttpClientError::Error(ref message)) if message == "unsupported redirect URL scheme"),
+        "{result:?}"
+    );
+}
+
+#[rstest]
+#[case::buffered(false)]
+#[case::streamed(true)]
+#[tokio::test]
+async fn truncated_body_returns_transport_error(#[case] streamed: bool) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let peer = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_headers(&mut stream).await;
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nshort")
+            .await
+            .unwrap();
+        stream.shutdown().await.unwrap();
+    });
+    let client = HttpClient::builder()
+        .use_system_proxy(false)
+        .timeout_secs(3)
+        .build()
+        .unwrap();
+    let url = format!("http://{addr}/truncated");
+
+    let error = if streamed {
+        let mut response = client.get_stream(url.clone()).await.unwrap();
+        loop {
+            match response.chunk().await {
+                Ok(Some(_)) => {}
+                Ok(None) => panic!("truncated body must not end successfully"),
+                Err(e) => break e,
+            }
+        }
+    } else {
+        send(&client, Method::GET, url.clone(), None)
+            .await
+            .unwrap_err()
+    };
+    peer.await.unwrap();
+
+    let HttpClientError::TransportError(message) = error else {
+        panic!("expected transport error, was {error:?}");
+    };
+    assert!(
+        message.contains("end of file before message length reached"),
+        "{message}"
+    );
+    assert!(message.ends_with(&format!(" for url ({url})")), "{message}");
+}
+
 #[tokio::test]
 async fn body_deadline_overrides_default_and_closes_connection() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -185,6 +322,9 @@ async fn body_deadline_overrides_default_and_closes_connection() {
 
 #[tokio::test]
 async fn http_proxy_preserves_absolute_target_and_authentication() {
+    const USERNAME: &str = "user";
+    const PASSWORD: &str = "secret";
+
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let peer = tokio::spawn(async move {
@@ -196,7 +336,7 @@ async fn http_proxy_preserves_absolute_target_and_authentication() {
             .unwrap();
         headers
     });
-    let proxy = format!("http://user:secret@{addr}");
+    let proxy = format!("http://{USERNAME}:{PASSWORD}@{addr}");
     let client = HttpClient::builder()
         .proxy_url(proxy.clone())
         .timeout_secs(3)
@@ -216,10 +356,11 @@ async fn http_proxy_preserves_absolute_target_and_authentication() {
         "{headers}"
     );
     assert!(headers.contains("host: 127.0.0.1:9\r\n"), "{headers}");
-    assert!(
-        headers.contains("proxy-authorization: Basic dXNlcjpzZWNyZXQ=\r\n"),
-        "{headers}"
+    let expected_auth = format!(
+        "proxy-authorization: Basic {}\r\n",
+        BASE64.encode(format!("{USERNAME}:{PASSWORD}"))
     );
+    assert!(headers.contains(&expected_auth), "{headers}");
     assert_eq!(response.status.as_u16(), 202);
     assert_eq!(response.headers, HashMap::new());
     assert_eq!(response.body, Bytes::from_static(b"proxied"));

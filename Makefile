@@ -332,7 +332,7 @@ build-debug: py-stubs  #-- Build and install the package in debug mode
 	$Q cd python && VIRTUAL_ENV= CARGO_TARGET_DIR=$(TARGET_DIR) uv run --no-sync maturin develop --profile $(CARGO_CI_PROFILE)
 
 .PHONY: build-wheel
-build-wheel: sync  #-- Build a wheel distribution in release mode
+build-wheel: check-cargo-cooldown sync  #-- Build a wheel distribution in release mode
 	$(info $(M) Building the Python wheel in release mode...)
 	$Q cd python && VIRTUAL_ENV= CARGO_TARGET_DIR=$(TARGET_DIR) uv run --no-sync maturin build --release --out ../dist
 
@@ -349,7 +349,7 @@ $(PY_STUB_INPUT_LIST): py-stub-input-list-force
 		rm "$$py_stub_input_tmp"; \
 	fi
 
-$(PY_STUB_STAMP): $(PY_STUB_INPUTS) $(PY_STUB_INPUT_LIST) | sync
+$(PY_STUB_STAMP): $(PY_STUB_INPUTS) $(PY_STUB_INPUT_LIST) | check-cargo-cooldown sync
 	$(info $(M) Generating Python type stubs...)
 	$Q mkdir -p "$(dir $(PY_STUB_STAMP))"
 	$Q cd python && VIRTUAL_ENV= NAUTILUS_STUB_PROFILE=$(CARGO_CI_PROFILE) \
@@ -494,6 +494,7 @@ pre-flight-steps:
 		$(MAKE) --no-print-directory sync \
 		&& $(MAKE) --no-print-directory format \
 		&& $(MAKE) --no-print-directory test-scripts-quiet \
+		&& $(MAKE) --no-print-directory check-cargo-cooldown \
 		&& $(MAKE) --no-print-directory check-code EXTRA_FEATURES="capnp,hypersync" \
 		&& $(MAKE) --no-print-directory check-code-sim \
 		&& $(MAKE) --no-print-directory cargo-test-sim \
@@ -693,8 +694,12 @@ docs-check-links:  #-- Check for broken links in documentation (periodic audit)
 #== Rust Development
 
 .PHONY: cargo-build
-cargo-build:  #-- Build Rust crates in release mode
+cargo-build: check-cargo-cooldown  #-- Build Rust crates in release mode
 	cargo build --release --all-features
+
+.PHONY: check-cargo-cooldown
+check-cargo-cooldown:  #-- Check new Cargo lockfile versions against the release cooldown
+	$Q bash scripts/check-cargo-cooldown.sh
 
 .PHONY: cargo-update
 cargo-update:  #-- Update Rust dependencies (versions from Cargo.toml)
@@ -1128,10 +1133,12 @@ cargo-test-coverage-crate-html-%:  #-- Run coverage for specific crate with HTML
 #   make cargo-miri-core MIRI_CORE_FILTER=...
 #   make cargo-miri-core MIRI_CORE_ARC_SWAP_FILTER=...
 #   make cargo-miri-plugin MIRI_PLUGIN_FILTER=...
+#   make cargo-miri-plugin MIRI_PLUGIN_PANIC_FILTER=...
 #   make cargo-miri-plugin MIRI_PLUGIN_MANIFEST_FILTER=...
 MIRI_TOOLCHAIN ?= $(shell bash scripts/tool-version.sh miri)
 MIRI_FLAGS ?= -Zmiri-disable-isolation -Zmiri-strict-provenance
 MIRI_CORE_ARC_SWAP_FLAGS ?= -Zmiri-disable-isolation -Zmiri-permissive-provenance
+MIRI_PLUGIN_PANIC_FLAGS ?= $(MIRI_FLAGS) -Zmiri-ignore-leaks
 MIRI_PLUGIN_MANIFEST_FLAGS ?= $(MIRI_FLAGS) -Zmiri-ignore-leaks
 MIRI_PROPTEST_CASES ?= 4
 
@@ -1153,7 +1160,11 @@ MIRI_MODEL_FILTER ?= -E 'test(/^(types::|identifiers::|orderbook::)/) and not te
 # Keep the plug-in Miri lane focused on the ABI boundary and panic guards.
 # Manifest fixtures model static cdylib storage with `Box::leak`, so that slice
 # runs with leak detection disabled while the boundary tests stay strict.
-MIRI_PLUGIN_FILTER ?= -E 'test(/^(boundary|panic)::/)'
+# Panicking payload destructors deliberately leak their replacement payloads,
+# keep those tests separate so ordinary panic paths still check for leaks.
+MIRI_PLUGIN_PANIC_TESTS := test(/^panic::tests::(drop_payload_swallows_panicking_drop|guard_survives_panic_any_with_panicking_drop|guard_contains_successive_panicking_payload_destructors|guards_contain_panicking_logger_payloads)$$/)
+MIRI_PLUGIN_FILTER ?= -E 'test(/^(boundary|panic)::/) and not ($(MIRI_PLUGIN_PANIC_TESTS))'
+MIRI_PLUGIN_PANIC_FILTER ?= -E '$(MIRI_PLUGIN_PANIC_TESTS)'
 MIRI_PLUGIN_MANIFEST_FILTER ?= -E 'test(/^manifest::/)'
 
 .PHONY: check-miri-toolchain
@@ -1208,6 +1219,14 @@ cargo-miri-plugin:  #-- Run nautilus-plugin boundary and manifest tests under Mi
 		--no-default-features \
 		--lib \
 		$(MIRI_PLUGIN_FILTER)
+	$(info $(M) Running nautilus-plugin panicking payload tests under Miri (filter: $(MIRI_PLUGIN_PANIC_FILTER))...)
+	# Nextest isolates each test; run the logger child directly because Miri cannot spawn it
+	NAUTILUS_TEST_PANIC_LOGGER_CHILD=1 MIRIFLAGS="$(MIRI_PLUGIN_PANIC_FLAGS)" \
+		cargo +$(MIRI_TOOLCHAIN) miri nextest run \
+		-p nautilus-plugin \
+		--no-default-features \
+		--lib \
+		$(MIRI_PLUGIN_PANIC_FILTER)
 	$(info $(M) Running nautilus-plugin manifest tests under Miri (filter: $(MIRI_PLUGIN_MANIFEST_FILTER))...)
 	MIRIFLAGS="$(MIRI_PLUGIN_MANIFEST_FLAGS)" \
 		cargo +$(MIRI_TOOLCHAIN) miri nextest run \
@@ -1324,20 +1343,22 @@ init-db:  #-- Initialize PostgreSQL database schema
 
 #== Python Testing
 
+PYTHON_TEST_ENV = PYTHONWARNDEFAULTENCODING=1 PYTHONWARNINGS="$(if $(PYTHONWARNINGS),$(PYTHONWARNINGS)$(comma))error::EncodingWarning,ignore::EncodingWarning:plotly.validator_cache"
+
 .PHONY: pytest-collect-fast
 pytest-collect-fast:  #-- Collect Python tests against the existing extension
 	@if [ -z "$(PYTHON_EXTENSION_PATH)" ]; then \
 		printf "$(YELLOW)Skipping Python test collection: run \`make build-debug\` first$(RESET)\n"; \
 	else \
 		printf "$(M) Collecting Python tests without rebuilding...\n"; \
-		cd python && VIRTUAL_ENV= uv run --no-sync pytest tests/ --collect-only -q; \
+		cd python && $(PYTHON_TEST_ENV) VIRTUAL_ENV= uv run --no-sync pytest tests/ --collect-only -q; \
 	fi
 
 .PHONY: pytest
 pytest: build-debug  #-- Run Python tests
 	$(info $(M) Running Python tests...)
-	$Q cd python && VIRTUAL_ENV= uv run --no-sync pytest -qq -rfE tests/ --ignore=tests/unit/test_live_node.py
-	$Q cd python && VIRTUAL_ENV= uv run --no-sync pytest -qq -rfE tests/unit/test_live_node.py
+	$Q cd python && $(PYTHON_TEST_ENV) VIRTUAL_ENV= uv run --no-sync pytest -qq -rfE tests/ --ignore=tests/unit/test_live_node.py
+	$Q cd python && $(PYTHON_TEST_ENV) VIRTUAL_ENV= uv run --no-sync pytest -qq -rfE tests/unit/test_live_node.py
 
 .PHONY: pytest-isolated
 pytest-isolated:  #-- Check the existing Python build outside the source checkout
@@ -1351,7 +1372,7 @@ pytest-doctest: build-debug  #-- Run supported Python doctests
 .PHONY: pytest-memray
 pytest-memray: build-debug  #-- Run Python memory leak tests with Memray
 	$(info $(M) Running Python memory leak tests...)
-	$Q cd python && VIRTUAL_ENV= uv run --no-sync pytest -qq -rfE memray_tests/
+	$Q cd python && $(PYTHON_TEST_ENV) VIRTUAL_ENV= uv run --no-sync pytest -qq -rfE memray_tests/
 
 .PHONY: ty
 ty: build-debug  #-- Type-check Python examples
